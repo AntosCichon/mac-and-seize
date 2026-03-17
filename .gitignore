@@ -1,0 +1,3 @@
+# Ignore thesis build files except pdf
+thesis/build/*
+!thesis/build/*.pdf
