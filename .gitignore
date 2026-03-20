@@ -1,0 +1,10 @@
+.env
+config.toml
+logs/
+exports/
+notes/
+
+.venv/
+__pycache__/
+
+# Explicit includes
