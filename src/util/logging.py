@@ -1,5 +1,5 @@
 from inspect import stack
-from src.util.consts import COLORS
+from src.util.static import COLORS
 from src.util.config import get_timer, get_config
 
 config = get_config()
@@ -7,6 +7,7 @@ timer = get_timer()
 
 # Set up logging directory
 config.logging.directory.mkdir(parents = True, exist_ok = True)
+(config.logging.directory / config.logging.filename).touch(exist_ok = True)
 
 class Message():
     def __init__(self, content):
