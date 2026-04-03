@@ -24,8 +24,9 @@ class CustomBaseModel(BaseModel):
         if not name.startswith("_"):
             old_value = self.__dict__.get(name)
             if old_value != value:
+                section = next((k for k, f in AppConfig.model_fields.items() if f.annotation is self.__class__), self.__class__.__name__)
                 from src.util.logging import LogMessage
-                LogMessage(f"Setting \"{name}\" has been modified: {old_value} -> {value}", level="WARNING")
+                LogMessage(f"Setting \"{section}.{name}\" has been modified: {old_value} -> {value}", level="WARNING")
         super().__setattr__(name, value)
 
 class ServerConfig(CustomBaseModel):
@@ -35,10 +36,12 @@ class ServerConfig(CustomBaseModel):
 class LoggingConfig(CustomBaseModel):
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     directory: Path = Path("logs")
-    filename: str = Field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d_%H:%M.log"))
+    filename: str = Field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d_%H:%M:%S.log"))
+    remove_on_exit: bool = True
 
 class SetupConfig(CustomBaseModel):
     config_path: Path = Path("config.toml")
+    export_directory: Path = Path("exports")
     timezone_offset: Annotated[int, Field(ge=-12, le=14)] = 0
 
 class RuntimeConfig(CustomBaseModel):
@@ -83,7 +86,7 @@ class Timer:
         else:
             return str(delta)
         
-    def measure_start(self) -> int:
+    def start_measure(self) -> int:
         self._measure.append(datetime.now(self.timezone))
         return len(self._measure) - 1
 

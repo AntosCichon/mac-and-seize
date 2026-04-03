@@ -15,7 +15,7 @@ def get_cli_args() -> Namespace:
         type = str,
         help = "Path to the configuration file (default: config.toml)",
         metavar = "PATH",
-        dest = "setup_config",
+        dest = "setup__config_path",
         )
 
     return parser.parse_args()
