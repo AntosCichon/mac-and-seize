@@ -4,6 +4,8 @@ logs/
 exports/
 notes/
 
+.vscode/
+
 .venv/
 __pycache__/
 
