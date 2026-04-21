@@ -5,11 +5,13 @@ from src.util.config import get_config, get_timer
 from src.util.logging import LogMessage, TerminalMessage
 from src.util.export import export_logs
 from src.util.static import WELCOME_ART
+from src.util.system import require_root
 
 def main():
     pass
 
 if __name__ == "__main__":
+    require_root()
     global config, timer
     config = get_config()
     timer = get_timer()
