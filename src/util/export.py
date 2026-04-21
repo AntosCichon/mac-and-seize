@@ -23,6 +23,7 @@ def archive(files: list[Path], archive_name: str = config.logging.filename) -> P
     start_time = timer.start_measure()
     with zipfile.ZipFile(archive_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         raw_size = 0
+        archived = []
         for i, file in enumerate(files, start=1):
             if not file.exists():
                 LogMessage(f"File {file} does not exist, skipping", level = "WARNING")
@@ -43,7 +44,8 @@ def archive(files: list[Path], archive_name: str = config.logging.filename) -> P
             raw_size += size
             TerminalMessage(f"Adding file {file.name} ({readable_size(size)}) to archive ({i}/{len(files)})", padding_char=" ", end="\r")
             zf.write(file, arcname=file.name)
-    LogMessage(f"Archive created at {archive_path} in {timer.runtime(reference = start_time)}s (original: {readable_size(raw_size)} > deflated: {readable_size(os.path.getsize(archive_path))})\nIncluded files: {', '.join([str(file) for file in files if file.exists()])}")
+            archived.append(file)
+    LogMessage(f"Archive created at {archive_path} in {timer.runtime(reference = start_time)}s (original: {readable_size(raw_size)} > deflated: {readable_size(os.path.getsize(archive_path))})\nIncluded files: {', '.join([str(file) for file in archived if file.exists()])}")
     TerminalMessage(f"Archive created at {archive_path} ({readable_size(raw_size)} > {readable_size(os.path.getsize(archive_path))})", padding_char=" ", color = "green")
     return archive_path
 
