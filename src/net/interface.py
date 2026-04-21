@@ -1,13 +1,27 @@
 import netifaces as ni
+from src.util.logging import LogMessage
 
 def get_interfaces():
     return ni.interfaces()
+
+iface_id: int | None = None
+def assign_id():
+    global iface_id
+    if iface_id is None:
+        iface_id = 0
+    else:
+        iface_id += 1
+    return iface_id
+
 
 class Interface:
     def __init__(self, name: str):
         if name not in get_interfaces():
             raise ValueError(f"Interface '{name}' does not exist.")
         self.name = name
+        self.id = assign_id()
+        self.system_path = f"/sys/class/net/{name}/"
+        self.state = self.get_state()
         self.ipv4 = {
             "addr": list(),
             "netmask": list(),
@@ -31,6 +45,13 @@ class Interface:
         self.get_ipv4()
         self.get_ipv6()
         self.get_mac()
+
+        LogMessage(f"Initialized new interface: {self.name} (id: {self.id})")
+
+    def get_state(self):
+        with open(f"{self.system_path}operstate", "r") as f:
+            state = f.read()
+        return state
 
     def get_ipv4(self, address_type = None) -> list | dict:
         if ni.AF_INET not in ni.ifaddresses(self.name):

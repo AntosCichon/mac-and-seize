@@ -5,6 +5,7 @@ from src.util.config import get_config, get_timer
 from src.util.logging import LogMessage, TerminalMessage
 from src.util.export import export_logs
 from src.util.static import WELCOME_ART
+from src.net.interface import Interface
 
 def main():
     pass
