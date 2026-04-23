@@ -1,5 +1,7 @@
 import netifaces as ni
 from src.util.logging import LogMessage
+from scapy.all import sendp, srp
+import threading
 
 def get_interfaces():
     return ni.interfaces()
@@ -82,3 +84,6 @@ class Interface:
         for address in [ address_type ] if address_type is not None else [ "addr", "peer" ]:
             self.mac[address] = [ info[i][address] if address in info[i] else None for i in range(self.mac["count"]) ]
         return self.mac[address_type] if address_type is not None else self.mac
+    
+    def send(self, packet, capture_response = False, timeout = 5):
+        return srp(packet, iface=self.name, threaded = False, timeout = timeout, verbose = False)
