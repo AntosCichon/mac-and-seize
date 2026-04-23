@@ -1,69 +1,68 @@
-from scapy.all import Ether, ARP, Dot1Q, IP, IPv6, ICMP, TCP, UDP, Raw
+from scapy.layers.l2 import Ether, ARP, Dot1Q
+from scapy.layers.inet import IP, ICMP, TCP, UDP
+from scapy.layers.inet6 import IPv6
+from scapy.packet import Raw
 
-class PacketBuilder:
-    def __init__(self):
-        self.layers = []
-
-    def add(self, layer):
+class L2Packet:
+    def __init__(self, src_mac: str, dst_mac: str, data: bytes | str = b""):
+        self.src_mac = src_mac
+        self.dst_mac = dst_mac
+        self.layers = [Ether(src = src_mac, dst = dst_mac)]
+        self.payload = data.encode() if isinstance(data, str) else data
+        
+    def add_layer(self, layer):
         self.layers.append(layer)
         return self
     
-    # Data link methods
-    def ethernet(self, **kwargs):
-        return self.add(Ether(**kwargs))
-    
-    def arp(self, **kwargs):
-        return self.add(ARP(**kwargs))
-    
-    def vlan(self, **kwargs):
-        return self.add(Dot1Q(**kwargs))
-    
-    # Network layer methods
-    def ipv4(self, **kwargs):
-        return self.add(IP(**kwargs))
-    
-    def ipv6(self, **kwargs):
-        return self.add(IPv6(**kwargs))
-    
-    def icmp(self, **kwargs):
-        return self.add(ICMP(**kwargs))
-    
-    # Transport layer methods
-    def tcp(self, **kwargs):
-        return self.add(TCP(**kwargs))
-    
-    def udp(self, **kwargs):
-        return self.add(UDP(**kwargs))
-    
-    # Payload
-    def payload(self, data: bytes | str):
-        if isinstance(data, str):
-            data = data.encode()
-        return self.add(Raw(load = data))
-    
     def build(self):
-        if not self.layers:
-            raise ValueError("No layers added to the packet.")
         packet = self.layers[0]
         for layer in self.layers[1:]:
             packet /= layer
+        if self.payload:
+            packet /= Raw(load = self.payload)
         return packet
-    
 
-    
-def arp_request(src_mac, src_ip, dst_ip):
-    return (
-        PacketBuilder()
-        .ethernet(dst = "ff:ff:ff:ff:ff:ff", src = src_mac)
-        .arp(op = 1, hwsrc = src_mac, psrc = src_ip, pdst = dst_ip, hwdst = "ff:ff:ff:ff:ff:ff")
-        .build()
-    )
+    def arp(self, src_ip: str, dst_ip: str, op: int = 1):
+        return self.add_layer(ARP(hwsrc = self.src_mac, psrc = src_ip, pdst = dst_ip, hwdst = "ff:ff:ff:ff:ff:ff", op = op))
 
-def ping_request(src_mac, src_ip, dst_mac, dst_ip):
-    return (
-        PacketBuilder()
-        .ethernet(dst = dst_mac, src = src_mac)
-        .ipv4(src = src_ip, dst = dst_ip)
-        .icmp(type = 8)
-        .build()
-    )
+    def vlan(self, vlan_id: int, priority: int = 0):
+        return self.add_layer(Dot1Q(vlan = vlan_id, prio = priority))
+
+class L3Packet(L2Packet):
+    def __init__(self, src_mac: str, dst_mac: str, src_ip: str, dst_ip: str):
+        super().__init__(src_mac, dst_mac)
+        self.src_ip = src_ip
+        self.dst_ip = dst_ip
+
+    def ipv4(self, **kwargs):
+        return self.add_layer(IP(src = self.src_ip, dst = self.dst_ip, **kwargs))
+    
+    def ipv6(self, **kwargs):
+        return self.add_layer(IPv6(src = self.src_ip, dst = self.dst_ip, **kwargs))
+
+    def icmp(self, **kwargs):
+        return self.add_layer(ICMP(**kwargs))
+
+class L4Packet(L3Packet):
+    def __init__(self, src_mac: str, dst_mac: str, src_ip: str, dst_ip: str, src_port: int, dst_port: int):
+        super().__init__(src_mac, dst_mac, src_ip, dst_ip)
+        self.src_port = src_port
+        self.dst_port = dst_port
+
+    def tcp(self, **kwargs):
+        return self.add_layer(TCP(sport = self.src_port, dport = self.dst_port, **kwargs))
+
+    def udp(self, **kwargs):
+        return self.add_layer(UDP(sport = self.src_port, dport = self.dst_port, **kwargs))
+    
+class ArpRequest(L2Packet):
+    def __init__(self, src_mac: str, src_ip: str, dst_ip: str):
+        super().__init__(src_mac, "ff:ff:ff:ff:ff:ff")
+        self.src_ip = src_ip
+        self.dst_ip = dst_ip
+        self.arp(src_ip, dst_ip)
+
+class PingRequest(L3Packet):
+    def __init__(self, src_mac: str, src_ip: str, dst_mac: str, dst_ip: str):
+        super().__init__(src_mac, dst_mac, src_ip, dst_ip)
+        self.icmp(type = 8)
