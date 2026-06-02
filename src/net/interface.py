@@ -1,5 +1,6 @@
 import netifaces as ni
 from src.util.logging import LogMessage
+import os
 
 def get_interfaces():
     return ni.interfaces()
@@ -82,3 +83,20 @@ class Interface:
         for address in [ address_type ] if address_type is not None else [ "addr", "peer" ]:
             self.mac[address] = [ info[i][address] if address in info[i] else None for i in range(self.mac["count"]) ]
         return self.mac[address_type] if address_type is not None else self.mac
+
+    def _change_state(self, new_state: str):
+        if new_state not in [ "up", "down" ]:
+            raise ValueError(f"Invalid state '{new_state}' for interface '{self.name}'. Valid states are 'up' and 'down'.")
+        if self.get_state() == new_state:
+            return
+        try:
+            os.system(f"ip link set {self.name} {new_state}")
+            LogMessage(f"Changed state of interface '{self.name}' to '{new_state}'.")
+        except Exception as e:
+            LogMessage(f"Failed to change state of interface '{self.name}' to '{new_state}': {e}", level = "error")
+    
+    def up(self):
+        self._change_state("up")
+    
+    def down(self):
+        self._change_state("down")
