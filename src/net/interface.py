@@ -1,6 +1,6 @@
 import netifaces as ni
 from src.util.logging import LogMessage
-from scapy.all import sendp, srp
+from scapy.all import sendp, srp, sniff
 import threading
 import os
 
@@ -88,6 +88,9 @@ class Interface:
     
     def send(self, packet, capture_response = False, timeout = 5):
         return srp(packet, iface=self.name, threaded = False, timeout = timeout, verbose = False)
+    
+    def listen(self, filter = None, timeout = None, packet_count = 0, save_file = None):
+        return sniff(iface=self.name, filter=filter, timeout=timeout, count=packet_count, prn=lambda x: x.summary(), store=save_file is not None)
 
     def _change_state(self, new_state: str):
         if new_state not in [ "up", "down" ]:
