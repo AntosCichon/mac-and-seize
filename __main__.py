@@ -6,7 +6,6 @@ from src.util.config import get_config, get_timer
 from src.util.logging import LogMessage, TerminalMessage
 from src.util.export import export_logs
 from src.util.static import WELCOME_ART
-from src.net.interface import Interface
 
 def main():
     i = Interface("eth1")
@@ -20,6 +19,7 @@ def main():
     i.up()
 
 if __name__ == "__main__":
+    require_root()
     global config, timer
     config = get_config()
     timer = get_timer()
