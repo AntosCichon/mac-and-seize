@@ -1,6 +1,7 @@
 import netifaces as ni
 from src.util.logging import LogMessage
 from scapy.all import sendp, srp, sniff
+from src.net.packet import Packet
 import threading
 import os
 
@@ -87,10 +88,16 @@ class Interface:
         return self.mac[address_type] if address_type is not None else self.mac
     
     def send(self, packet, capture_response = False, timeout = 5):
-        return srp(packet, iface=self.name, threaded = False, timeout = timeout, verbose = False)
+        pkt = packet.build() if isinstance(packet, Packet) else packet
+        return srp(pkt, iface=self.name, threaded = False, timeout = timeout, verbose = False)
+    
+    @staticmethod
+    def parse_received(packet):
+        return Packet.from_scapy(packet)
     
     def listen(self, filter = None, timeout = None, packet_count = 0, save_file = None):
-        return sniff(iface=self.name, filter=filter, timeout=timeout, count=packet_count, prn=lambda x: x.summary(), store=save_file is not None)
+        captured = sniff(iface=self.name, filter=filter, timeout=timeout, count=packet_count)
+        return [ self.parse_received(packet) for packet in captured ]
 
     def _change_state(self, new_state: str):
         if new_state not in [ "up", "down" ]:
@@ -101,7 +108,7 @@ class Interface:
             os.system(f"ip link set {self.name} {new_state}")
             LogMessage(f"Changed state of interface '{self.name}' to '{new_state}'.")
         except Exception as e:
-            LogMessage(f"Failed to change state of interface '{self.name}' to '{new_state}': {e}", level = "error")
+            LogMessage(f"Failed to change state of interface '{self.name}' to '{new_state}': {e}", level = "ERROR")
     
     def up(self):
         self._change_state("up")

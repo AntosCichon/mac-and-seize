@@ -2,67 +2,151 @@ from scapy.layers.l2 import Ether, ARP, Dot1Q
 from scapy.layers.inet import IP, ICMP, TCP, UDP
 from scapy.layers.inet6 import IPv6
 from scapy.packet import Raw
+from scapy.utils import wrpcap
+import io
+from contextlib import redirect_stdout
 
-class L2Packet:
-    def __init__(self, src_mac: str, dst_mac: str, data: bytes | str = b""):
-        self.src_mac = src_mac
-        self.dst_mac = dst_mac
-        self.layers = [Ether(src = src_mac, dst = dst_mac)]
-        self.payload = data.encode() if isinstance(data, str) else data
-        
+
+class Packet:
+    def __init__(self, pkt=None):
+        self._pkt = pkt if pkt is not None else Ether()
+
+    @classmethod
+    def from_scapy(cls, pkt):
+        return cls(pkt)
+
+    # --- Factories ---
+
+    @classmethod
+    def arp_request(cls, src_mac: str, src_ip: str, dst_ip: str):
+        return cls(
+            Ether(src=src_mac, dst="ff:ff:ff:ff:ff:ff") /
+            ARP(hwsrc=src_mac, psrc=src_ip, pdst=dst_ip, op=1)
+        )
+
+    @classmethod
+    def arp_reply(cls, src_mac: str, src_ip: str, dst_mac: str, dst_ip: str):
+        return cls(
+            Ether(src=src_mac, dst=dst_mac) /
+            ARP(hwsrc=src_mac, psrc=src_ip, hwdst=dst_mac, pdst=dst_ip, op=2)
+        )
+
+    @classmethod
+    def ping(cls, src_mac: str, src_ip: str, dst_mac: str, dst_ip: str, **icmp_kwargs):
+        return cls(
+            Ether(src=src_mac, dst=dst_mac) /
+            IP(src=src_ip, dst=dst_ip) /
+            ICMP(type=8, **icmp_kwargs)
+        )
+
+    @classmethod
+    def tcp(cls, src_mac: str, src_ip: str, dst_mac: str, dst_ip: str,
+            src_port: int, dst_port: int, data: bytes | str = b"", **tcp_kwargs):
+        payload = data.encode() if isinstance(data, str) else data
+        pkt = (
+            Ether(src=src_mac, dst=dst_mac) /
+            IP(src=src_ip, dst=dst_ip) /
+            TCP(sport=src_port, dport=dst_port, **tcp_kwargs)
+        )
+        if payload:
+            pkt /= Raw(load=payload)
+        return cls(pkt)
+
+    @classmethod
+    def udp(cls, src_mac: str, src_ip: str, dst_mac: str, dst_ip: str,
+            src_port: int, dst_port: int, data: bytes | str = b"", **udp_kwargs):
+        payload = data.encode() if isinstance(data, str) else data
+        pkt = (
+            Ether(src=src_mac, dst=dst_mac) /
+            IP(src=src_ip, dst=dst_ip) /
+            UDP(sport=src_port, dport=dst_port, **udp_kwargs)
+        )
+        if payload:
+            pkt /= Raw(load=payload)
+        return cls(pkt)
+
+    # --- Layer access & manipulation ---
+
+    def layer(self, layer_class):
+        """Return a layer for direct field manipulation, or None if absent."""
+        return self._pkt.getlayer(layer_class)
+
+    def has_layer(self, layer_class) -> bool:
+        return self._pkt.haslayer(layer_class) != 0
+
     def add_layer(self, layer):
-        self.layers.append(layer)
+        self._pkt /= layer
         return self
-    
+
+    def set_payload(self, data: bytes | str):
+        payload = data.encode() if isinstance(data, str) else data
+        if self._pkt.haslayer(Raw):
+            self._pkt.getlayer(Raw).load = payload
+        else:
+            self._pkt /= Raw(load=payload)
+        return self
+
+    # --- Build / pcap ---
+
     def build(self):
-        packet = self.layers[0]
-        for layer in self.layers[1:]:
-            packet /= layer
-        if self.payload:
-            packet /= Raw(load = self.payload)
-        return packet
+        return self._pkt
 
-    def arp(self, src_ip: str, dst_ip: str, op: int = 1):
-        return self.add_layer(ARP(hwsrc = self.src_mac, psrc = src_ip, pdst = dst_ip, hwdst = "ff:ff:ff:ff:ff:ff", op = op))
+    def pcap(self):
+        return self._pkt
 
-    def vlan(self, vlan_id: int, priority: int = 0):
-        return self.add_layer(Dot1Q(vlan = vlan_id, prio = priority))
+    # --- Human-readable output ---
 
-class L3Packet(L2Packet):
-    def __init__(self, src_mac: str, dst_mac: str, src_ip: str, dst_ip: str):
-        super().__init__(src_mac, dst_mac)
-        self.src_ip = src_ip
-        self.dst_ip = dst_ip
+    def summary(self) -> str:
+        return self._pkt.summary()
 
-    def ipv4(self, **kwargs):
-        return self.add_layer(IP(src = self.src_ip, dst = self.dst_ip, **kwargs))
-    
-    def ipv6(self, **kwargs):
-        return self.add_layer(IPv6(src = self.src_ip, dst = self.dst_ip, **kwargs))
+    def show(self) -> str:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self._pkt.show()
+        return buf.getvalue()
 
-    def icmp(self, **kwargs):
-        return self.add_layer(ICMP(**kwargs))
+    def info(self) -> dict:
+        result = {}
+        if self._pkt.haslayer(Ether):
+            eth = self._pkt[Ether]
+            result["src_mac"] = eth.src
+            result["dst_mac"] = eth.dst
+        if self._pkt.haslayer(IP):
+            ip = self._pkt[IP]
+            result["src_ip"] = ip.src
+            result["dst_ip"] = ip.dst
+            result["ttl"] = ip.ttl
+        elif self._pkt.haslayer(IPv6):
+            ip6 = self._pkt[IPv6]
+            result["src_ip"] = ip6.src
+            result["dst_ip"] = ip6.dst
+        if self._pkt.haslayer(TCP):
+            tcp = self._pkt[TCP]
+            result["src_port"] = tcp.sport
+            result["dst_port"] = tcp.dport
+            result["flags"] = str(tcp.flags)
+            result["seq"] = tcp.seq
+            result["ack"] = tcp.ack
+        elif self._pkt.haslayer(UDP):
+            udp = self._pkt[UDP]
+            result["src_port"] = udp.sport
+            result["dst_port"] = udp.dport
+        elif self._pkt.haslayer(ICMP):
+            icmp = self._pkt[ICMP]
+            result["icmp_type"] = icmp.type
+            result["icmp_code"] = icmp.code
+        elif self._pkt.haslayer(ARP):
+            arp = self._pkt[ARP]
+            result["arp_op"] = "request" if arp.op == 1 else "reply"
+            result["src_ip"] = arp.psrc
+            result["dst_ip"] = arp.pdst
+        if self._pkt.haslayer(Raw):
+            result["payload"] = bytes(self._pkt[Raw].load)
+        return result
 
-class L4Packet(L3Packet):
-    def __init__(self, src_mac: str, dst_mac: str, src_ip: str, dst_ip: str, src_port: int, dst_port: int):
-        super().__init__(src_mac, dst_mac, src_ip, dst_ip)
-        self.src_port = src_port
-        self.dst_port = dst_port
+    def __repr__(self):
+        return f"Packet({self._pkt.summary()})"
 
-    def tcp(self, **kwargs):
-        return self.add_layer(TCP(sport = self.src_port, dport = self.dst_port, **kwargs))
 
-    def udp(self, **kwargs):
-        return self.add_layer(UDP(sport = self.src_port, dport = self.dst_port, **kwargs))
-    
-class ArpRequest(L2Packet):
-    def __init__(self, src_mac: str, src_ip: str, dst_ip: str):
-        super().__init__(src_mac, "ff:ff:ff:ff:ff:ff")
-        self.src_ip = src_ip
-        self.dst_ip = dst_ip
-        self.arp(src_ip, dst_ip)
-
-class PingRequest(L3Packet):
-    def __init__(self, src_mac: str, src_ip: str, dst_mac: str, dst_ip: str):
-        super().__init__(src_mac, dst_mac, src_ip, dst_ip)
-        self.icmp(type = 8)
+def write_pcap(filename: str, packets: list, append: bool = True):
+    wrpcap(filename, [p.pcap() if isinstance(p, Packet) else p for p in packets], append=append)
