@@ -1,14 +1,22 @@
 import os
+import time
 os.chdir(os.path.dirname(__file__))
 
 from src.util.config import get_config, get_timer
 from src.util.logging import LogMessage, TerminalMessage
 from src.util.export import export_logs
 from src.util.static import WELCOME_ART
-from src.util.system import require_root
 
 def main():
-    pass
+    i = Interface("eth1")
+    i.up()
+    print("Interface state:", i.get_state())
+    time.sleep(5)
+    print("Bringing interface down...")
+    i.down()
+    print("Interface state:", i.get_state())
+    time.sleep(5)
+    i.up()
 
 if __name__ == "__main__":
     require_root()
