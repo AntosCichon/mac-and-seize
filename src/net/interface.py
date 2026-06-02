@@ -91,13 +91,9 @@ class Interface:
         pkt = packet.build() if isinstance(packet, Packet) else packet
         return srp(pkt, iface=self.name, threaded = False, timeout = timeout, verbose = False)
     
-    @staticmethod
-    def parse_received(packet):
-        return Packet.from_scapy(packet)
-    
-    def listen(self, filter = None, timeout = None, packet_count = 0, save_file = None):
+    def listen(self, filter = None, timeout = None, packet_count = 0) -> list:
         captured = sniff(iface=self.name, filter=filter, timeout=timeout, count=packet_count)
-        return [ self.parse_received(packet) for packet in captured ]
+        return [ Packet.from_scapy(packet) for packet in captured ]
 
     def _change_state(self, new_state: str):
         if new_state not in [ "up", "down" ]:

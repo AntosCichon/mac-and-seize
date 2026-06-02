@@ -8,6 +8,20 @@ from contextlib import redirect_stdout
 
 
 class Packet:
+
+    """
+    Wrapper class for scapy packets, example usage:
+
+    1. ARP request:
+        pkt = Packet.arp_request(src_mac="00:11:22:33:44:55", src_ip="192.168.1.1", dst_ip="192.168.1.2")
+
+    2. TCP packet with custom flags (URG, PSH, FIN):
+        pkt = Packet.tcp(src_mac="00:11:22:33:44:55", src_ip="192.168.1.1", dst_mac="66:77:88:99:AA:BB", dst_ip="192.168.1.2", src_port=12345, dst_port=80, flags="UPF")
+
+    3. Tag existing packet with VLAN:
+        pkt = Packet(...).add_layer(Dot1Q(vlan=100))
+    """
+
     def __init__(self, pkt=None):
         self._pkt = pkt if pkt is not None else Ether()
 
@@ -68,7 +82,6 @@ class Packet:
     # --- Layer access & manipulation ---
 
     def layer(self, layer_class):
-        """Return a layer for direct field manipulation, or None if absent."""
         return self._pkt.getlayer(layer_class)
 
     def has_layer(self, layer_class) -> bool:
@@ -99,11 +112,8 @@ class Packet:
     def summary(self) -> str:
         return self._pkt.summary()
 
-    def show(self) -> str:
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            self._pkt.show()
-        return buf.getvalue()
+    def show(self) -> str | None:
+        return self._pkt.show(dump=True)
 
     def info(self) -> dict:
         result = {}
