@@ -1,0 +1,19 @@
+[project]
+name = "mac-and-seize"
+version = "0.1.0"
+description = "Network interface and packet tooling with a Typer CLI and a (planned) localhost web interface."
+requires-python = ">=3.13"
+dependencies = [
+    "netifaces>=0.11.0",
+    "pydantic>=2.13.4",
+    "pydantic-settings>=2.14.1",
+    "python-nmap>=0.7.1",
+    "scapy>=2.7.0",
+    "typer>=0.26.8",
+]
+
+# This is a standalone application, not a distributable/installable package:
+# clone the repo and run it directly (see main.py / run.sh). Telling uv the
+# project is not a package means `uv run` never tries to build/install it.
+[tool.uv]
+package = false

@@ -1,3 +1,7 @@
+# Copy to config.toml and adjust. Unknown keys/sections are rejected.
+# Every value below is optional; omitted values fall back to defaults.
+# Environment overrides use the MAS_ prefix, e.g. MAS_LOGGING__LEVEL=DEBUG
+
 [server]
 port = 8080
 listen_address = "127.0.0.1"
@@ -5,6 +9,9 @@ listen_address = "127.0.0.1"
 [logging]
 level = "DEBUG"
 directory = "logs"
+# filename = "custom.log"   # defaults to a timestamped name
+remove_on_exit = true
 
 [setup]
-first_execute = true
+export_directory = "exports"
+timezone_offset = 0
