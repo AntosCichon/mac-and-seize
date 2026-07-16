@@ -29,6 +29,11 @@ class Param:
     ``1,2,3``), a single value being a one-item collection. The handler is then
     invoked once per value (front-ends fan out over the collection), so handlers
     can stay written for a single value.
+
+    When ``is_flag`` is set, the param is a boolean switch: it takes no value on
+    the command line (``--name``, not ``--name value``), is ``True`` when
+    present and ``default`` (normally ``False``) when absent. Only meaningful
+    on optional (``required=False``) params.
     """
 
     name: str
@@ -37,6 +42,7 @@ class Param:
     required: bool = True
     default: Any = None
     multiple: bool = False
+    is_flag: bool = False
 
 
 @dataclass

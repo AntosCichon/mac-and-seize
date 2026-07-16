@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from ipaddress import (
     IPv4Address,
     IPv4Interface,
@@ -13,7 +14,7 @@ from ipaddress import (
 from mac_and_seize.modules.interface.net import (
     Interface,
     add_ip_address,
-    get_device_routes,
+    capture_routes,
     get_permanent_mac,
     interface_names,
     remove_ip_address,
@@ -61,6 +62,15 @@ def _normalize_gateway(gateway: str, version: int) -> str:
         raise ValueError(f"Invalid IPv{version} gateway {gateway!r}: {exc}") from exc
 
 
+@dataclass
+class MacChangeResult:
+    """Outcome of :meth:`InterfaceService.set_mac`."""
+
+    mac: str
+    routes_restored: int = 0
+    routes_failed: int = 0
+
+
 class InterfaceService:
     """Manage and inspect network interfaces.
 
@@ -105,12 +115,18 @@ class InterfaceService:
         )
         return result
 
-    def set_mac(self, name: str, mac: str) -> str:
-        """Set the interface's MAC address; returns the applied address.
+    def set_mac(
+        self, name: str, mac: str, *, preserve_routes: bool = True
+    ) -> MacChangeResult:
+        """Set the interface's MAC address; returns the outcome.
 
         Passing ``"default"`` (case-insensitive) restores the permanent
         (factory) MAC address. The interface is brought down for the change and
-        its prior state is restored afterwards.
+        its prior state is restored afterwards. Bringing the link down drops
+        its routes (including the default gateway); by default they are
+        snapshotted beforehand and restored once the interface is back up.
+        Pass ``preserve_routes=False`` to skip this and leave routing to
+        whatever else manages it (DHCP client, NetworkManager, ...).
         """
         iface = self.get(name)
 
@@ -128,6 +144,10 @@ class InterfaceService:
             target = _normalize_mac(mac)
 
         previous_state = iface.get_state()
+        # The link cycle drops routes for both families, so snapshot both.
+        routes = (
+            capture_routes(name) if preserve_routes and previous_state != "down" else []
+        )
         set_link_state(name, "down")
         try:
             set_mac_address(name, target)
@@ -135,10 +155,30 @@ class InterfaceService:
             if previous_state != "down":
                 set_link_state(name, "up")
 
+        restored = failed = 0
+        if routes:
+            restored, failed = self._preserve(name, routes)
+
         iface.refresh_addresses()
         iface.state = iface.get_state()
         self._log.info("Set MAC of %s to %s", name, target)
-        return target
+        return MacChangeResult(target, restored, failed)
+
+    def _preserve(self, name: str, routes: list[dict]) -> tuple[int, int]:
+        """Reinstall snapshotted routes and log the outcome; return the counts.
+
+        Thin wrapper over :func:`restore_routes` (which does the actual filtering
+        and best-effort re-application) that records how many routes came back.
+        """
+        restored, failed = restore_routes(name, routes)
+        if failed:
+            self._log.warning(
+                "Restored %d/%d route(s) on %s; %d could not be reinstalled",
+                len(restored), len(routes), name, len(failed),
+            )
+        else:
+            self._log.info("Restored %d route(s) on %s", len(restored), name)
+        return len(restored), len(failed)
 
     def add_ip(
         self, name: str, address: str, version: int, gateway: str | None = None
@@ -166,32 +206,37 @@ class InterfaceService:
         return normalized
 
     def set_ip(
-        self, name: str, address: str, version: int, gateway: str | None = None
-    ) -> tuple[str, str | None]:
+        self,
+        name: str,
+        address: str,
+        version: int,
+        gateway: str | None = None,
+        *,
+        preserve_routes: bool = True,
+    ) -> tuple[str, str | None, int, int]:
         """Replace the interface's IPv4/IPv6 address(es) with a single address.
 
         Existing addresses of the same family are flushed before the new one is
         added. Because flushing an address also tears down the routes that
         depended on it (the default gateway, static routes), the interface's
-        routes are captured first and re-applied afterwards on a best-effort
-        basis - so connectivity is preserved when the new address is in the same
-        subnet. An explicit ``gateway`` still wins over a restored default route.
-        Returns ``(applied_cidr, applied_gateway)``.
+        routes for that family are, by default, snapshotted first and re-applied
+        afterwards on a best-effort basis - so connectivity is preserved when the
+        new address is in the same subnet (shared with ``set_mac`` via
+        :func:`restore_routes`). Pass ``preserve_routes=False`` to skip this. An
+        explicit ``gateway`` still wins over a restored default route. Returns
+        ``(applied_cidr, applied_gateway, routes_restored, routes_failed)``.
         """
         iface = self.get(name)
         normalized = _normalize_ip(address, version)
-        preserved = get_device_routes(name, version)
+        routes = capture_routes(name, version) if preserve_routes else []
         set_ip_address(name, normalized, version)
-        restored = restore_routes(name, version, preserved)
-        if restored:
-            self._log.info(
-                "Restored %d route(s) on %s after set: %s",
-                len(restored), name, restored,
-            )
+        restored = failed = 0
+        if routes:
+            restored, failed = self._preserve(name, routes)
         gw = self._apply_gateway(name, gateway, version)
         iface.refresh_addresses()
         self._log.info("Set IPv%d of %s to %s", version, name, normalized)
-        return normalized, gw
+        return normalized, gw, restored, failed
 
     def _apply_gateway(
         self, name: str, gateway: str | None, version: int

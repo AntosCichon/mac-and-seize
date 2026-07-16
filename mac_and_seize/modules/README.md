@@ -99,6 +99,7 @@ class Param:
     required: bool = True
     default: Any = None  # used when an optional param is omitted
     multiple: bool = False  # accept a list/range; handler runs once per value
+    is_flag: bool = False   # a `--name` switch that takes no value (see §4.4)
 
 @dataclass
 class Action:
@@ -173,14 +174,32 @@ Use `multiple=True` only when running the action per-value is safe. Avoid it for
 "replace"-style operations (e.g. an address `set` that flushes first), where
 looping would undo earlier values.
 
-### 4.4 `requires_root`
+### 4.4 `is_flag` — boolean switches
+
+Set `is_flag=True` on an **optional** param to make it a plain switch instead
+of a `--name value` option: it takes no value on the command line, arrives as
+`True` when the user passes `--name`, and as its `default` (normally `False`)
+when they don't.
+
+```python
+Param("no-preserve", "Skip restoring routes dropped by the change",
+      bool, required=False, default=False, is_flag=True)
+# CLI: "interface mac eth0 <mac>"                 -> {"no-preserve": False}
+# CLI: "interface mac eth0 <mac> --no-preserve"    -> {"no-preserve": True}
+```
+
+Use a hyphenated `name` (`"no-preserve"`, not `"no_preserve"`) if that's the
+CLI spelling you want — the CLI flag is `--<param.name>` verbatim, and the same
+string is the key in `values`, so the handler reads `values["no-preserve"]`.
+
+### 4.5 `requires_root`
 
 Set `requires_root=True` for anything that needs elevated privileges. The CLI
 **blocks** the action with a helpful message when not running as root (the user
 can relaunch with the built-in `sudo` command), and colours it red in help. You
 do not check privileges yourself.
 
-### 4.5 `examples`
+### 4.6 `examples`
 
 Each string is shown verbatim under `Examples:` in `<cmd> help`. Write them as
 full command lines, e.g. `"bluetooth device pair AA:BB:CC:DD:EE:FF"`.

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import array
 import fcntl
+import json
 import socket
 import struct
 import subprocess
@@ -98,76 +99,6 @@ def set_ip_address(name: str, address: str, version: int) -> None:
     _run(["ip", "addr", "add", address, "dev", name])
 
 
-# Tokens ``ip route show`` prints as status but ``ip route replace`` rejects.
-_ROUTE_STATUS_FLAGS = {"linkdown", "dead"}
-
-
-def get_device_routes(name: str, version: int) -> list[str]:
-    """Return the routes currently attached to an interface (one spec per line).
-
-    Output mirrors ``ip -<v> route show dev <name>`` (the ``dev <name>`` clause
-    is implied and therefore omitted from each line).
-    """
-    flag = _family_flag(version)
-    result = _run(["ip", flag, "route", "show", "dev", name])
-    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
-
-
-def _route_replace_args(spec: str, name: str) -> list[str] | None:
-    """Convert a captured route line into ``ip route replace`` arguments.
-
-    Returns ``None`` for kernel-managed connected routes (the kernel recreates
-    those for the new address). A stale ``src <addr>`` clause is dropped so the
-    kernel picks a valid source, status-only flags are removed, and ``dev`` is
-    re-attached (``ip route show dev`` omits it).
-    """
-    tokens = spec.split()
-    if "proto" in tokens:
-        proto = tokens[tokens.index("proto") + 1 : tokens.index("proto") + 2]
-        if proto == ["kernel"] and "via" not in tokens:
-            return None
-
-    args: list[str] = []
-    skip_next = False
-    for token in tokens:
-        if skip_next:
-            skip_next = False
-            continue
-        if token == "src":  # drop 'src <addr>' - source may no longer be valid
-            skip_next = True
-            continue
-        if token in _ROUTE_STATUS_FLAGS:
-            continue
-        args.append(token)
-    if "dev" not in args:
-        args += ["dev", name]
-    return args
-
-
-def restore_routes(name: str, version: int, routes: list[str]) -> list[str]:
-    """Best-effort re-application of routes captured before an address change.
-
-    Used by ``set`` to preserve connectivity: the default gateway and other
-    routes that were valid beforehand are reinstalled after the new address is
-    added. Kernel-managed connected routes are skipped (auto-recreated), and any
-    route that can no longer be installed - e.g. its gateway is off-link because
-    the new address is in a different subnet - is skipped instead of failing the
-    whole operation. Returns the specs that were successfully restored.
-    """
-    flag = _family_flag(version)
-    restored: list[str] = []
-    for spec in routes:
-        args = _route_replace_args(spec, name)
-        if args is None:
-            continue
-        try:
-            _run(["ip", flag, "route", "replace", *args])
-        except PrivilegedCommandError:
-            continue
-        restored.append(spec)
-    return restored
-
-
 def set_default_gateway(name: str, gateway: str, version: int) -> None:
     """Set (replace) the default route for a family via ``ip route replace``.
 
@@ -176,6 +107,96 @@ def set_default_gateway(name: str, gateway: str, version: int) -> None:
     """
     flag = _family_flag(version)
     _run(["ip", flag, "route", "replace", "default", "via", gateway, "dev", name])
+
+
+# --- Route preservation ---
+#
+# Several operations tear down an interface's routes as a side effect: changing
+# the MAC cycles the link down/up, and replacing an address flushes that family.
+# The default gateway and any manually-added routes do not come back on their
+# own, so ``capture_routes`` snapshots them beforehand and ``restore_routes``
+# best-effort reinstalls them afterward, keeping connectivity across the change.
+# Both ``interface mac`` and ``interface ip4/ip6 set`` share this one mechanism.
+
+
+def capture_routes(name: str, version: int | None = None) -> list[dict]:
+    """Snapshot the routes attached to ``name`` for later :func:`restore_routes`.
+
+    Parsed from ``ip -j route show`` (JSON) so restoration does not depend on
+    reconstructing a command line from whitespace-sensitive text. ``version``
+    limits the snapshot to one family (4 or 6); ``None`` captures both - used
+    when the whole link is cycled (a MAC change), versus a single-family address
+    ``set``. Each entry is the JSON object ``ip`` reported, tagged with a
+    ``"family"`` key.
+    """
+    versions = (version,) if version is not None else (4, 6)
+    entries: list[dict] = []
+    for v in versions:
+        result = _run(["ip", _family_flag(v), "-j", "route", "show", "dev", name])
+        try:
+            routes = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError:
+            # iproute2 too old for "-j"; nothing we can safely snapshot.
+            continue
+        for route in routes:
+            route["family"] = v
+            entries.append(route)
+    return entries
+
+
+def _is_autorecreated(route: dict) -> bool:
+    """True for kernel-managed connected routes.
+
+    The kernel recreates the connected/link route for an address on its own once
+    the address is (re)assigned, so we must not try to reinstall it ourselves.
+    Identified by ``protocol == "kernel"`` with no gateway.
+    """
+    return route.get("protocol") == "kernel" and not route.get("gateway")
+
+
+def _replace_route_command(name: str, route: dict) -> list[str]:
+    """Build the ``ip route replace`` command that reinstalls one captured route.
+
+    A ``src``/``prefsrc`` clause is intentionally dropped: after an address
+    change the old source may be invalid, so the kernel is left to pick one.
+    """
+    cmd = [
+        "ip", _family_flag(route["family"]), "route", "replace",
+        route.get("dst", "default"),
+    ]
+    if route.get("gateway"):
+        cmd += ["via", route["gateway"]]
+    if route.get("scope"):
+        cmd += ["scope", str(route["scope"])]
+    if route.get("metric") is not None:
+        cmd += ["metric", str(route["metric"])]
+    cmd += ["dev", name]
+    return cmd
+
+
+def restore_routes(name: str, routes: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Best-effort re-application of routes from :func:`capture_routes`.
+
+    Kernel-managed connected routes are skipped (the kernel recreates them).
+    Direct (non-gateway) routes are reinstalled before ``via`` routes, since a
+    gateway route is only accepted once the on-link route that reaches the
+    gateway exists. A route that can no longer be installed - e.g. its gateway is
+    off-link because a new address moved the interface to another subnet - is
+    skipped rather than aborting the whole operation. Returns
+    ``(restored, failed)``.
+    """
+    restored: list[dict] = []
+    failed: list[dict] = []
+    for route in sorted(routes, key=lambda r: r.get("gateway") is not None):
+        if _is_autorecreated(route):
+            continue
+        try:
+            _run(_replace_route_command(name, route))
+        except PrivilegedCommandError:
+            failed.append(route)
+            continue
+        restored.append(route)
+    return restored, failed
 
 
 def get_permanent_mac(name: str) -> str | None:

@@ -466,12 +466,17 @@ def _parse_args(action: Action, tokens: list[str]) -> dict:
                 raise UsageError(
                     f"Unknown option '--{name}'.\nUsage: {_usage_line(action)}"
                 )
+            param = optional[name]
+            if param.is_flag:
+                values[name] = True
+                index += 1
+                continue
             index += 1
             if index >= len(tokens):
                 raise UsageError(
                     f"Option '--{name}' needs a value.\nUsage: {_usage_line(action)}"
                 )
-            values[name] = _parse_value(optional[name], tokens[index])
+            values[name] = _parse_value(param, tokens[index])
         else:
             positionals.append(token)
         index += 1
@@ -566,10 +571,12 @@ def _execute(context: AppContext, action: Action, tokens: list[str]) -> None:
 def _usage_line(action: Action) -> str:
     parts = [action.command_path]
     for param in action.params:
-        placeholder = f"<{param.name}{'...' if param.multiple else ''}>"
         if param.required:
-            parts.append(placeholder)
+            parts.append(f"<{param.name}{'...' if param.multiple else ''}>")
+        elif param.is_flag:
+            parts.append(f"[--{param.name}]")
         else:
+            placeholder = f"<{param.name}{'...' if param.multiple else ''}>"
             parts.append(f"[--{param.name} {placeholder}]")
     return " ".join(parts)
 
@@ -663,6 +670,9 @@ def _command_help(action: Action) -> None:
     if action.params:
         console.print("[bold]Arguments:[/]")
         for param in action.params:
+            if param.is_flag:
+                console.print(f"  [cyan]{f'--{param.name}':<14}[/] {param.help} [dim](flag)[/]")
+                continue
             label = f"<{param.name}>" if param.required else f"--{param.name}"
             kind = "required" if param.required else "optional"
             note = ""

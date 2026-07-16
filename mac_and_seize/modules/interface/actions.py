@@ -68,10 +68,18 @@ def _interface_down(context: "AppContext", values: dict) -> str:
 
 
 def _set_mac(context: "AppContext", values: dict) -> str:
-    applied = _service(context).set_mac(values["name"], values["mac"])
-    if values["mac"].strip().lower() == "default":
-        return f"{values['name']} MAC reset to factory default {applied}"
-    return f"{values['name']} MAC set to {applied}"
+    result = _service(context).set_mac(
+        values["name"], values["mac"], preserve_routes=not values["no-preserve"]
+    )
+    label = "MAC reset to factory default" if values["mac"].strip().lower() == "default" \
+        else "MAC set to"
+    message = f"{values['name']} {label} {result.mac}"
+    if result.routes_restored or result.routes_failed:
+        detail = f"{result.routes_restored} route(s) restored"
+        if result.routes_failed:
+            detail += f", {result.routes_failed} failed - see logs"
+        message += f" [{detail}]"
+    return message
 
 
 def _make_ip_handler(operation: str, version: int) -> Callable[["AppContext", dict], str]:
@@ -87,13 +95,22 @@ def _make_ip_handler(operation: str, version: int) -> Callable[["AppContext", di
 
         gateway = values.get("gateway")
         if operation == "set":
-            applied, gw = service.set_ip(name, address, version, gateway)
+            applied, gw, restored, failed = service.set_ip(
+                name, address, version, gateway,
+                preserve_routes=not values.get("no-preserve", False),
+            )
             message = f"{name}: IPv{version} set to {applied}"
         else:  # add
             applied, gw = service.add_ip(name, address, version, gateway)
+            restored = failed = 0
             message = f"{name}: added IPv{version} address {applied}"
         if gw:
             message += f", default gateway {gw}"
+        if restored or failed:
+            detail = f"{restored} route(s) restored"
+            if failed:
+                detail += f", {failed} failed - see logs"
+            message += f" [{detail}]"
         return message
 
     return handler
@@ -118,6 +135,14 @@ def _ip_actions() -> list[Action]:
             f"Also set the default gateway (e.g. {example_gw})",
             str,
             required=False,
+        )
+        no_preserve_param = Param(
+            "no-preserve",
+            "Skip restoring routes dropped when the address is flushed",
+            bool,
+            required=False,
+            default=False,
+            is_flag=True,
         )
 
         actions.append(Action(
@@ -146,12 +171,15 @@ def _ip_actions() -> list[Action]:
             f"interface.{fam}.set",
             f"Set IPv{version} address",
             f"Replace the interface's IPv{version} address(es) with a single "
-            "address (requires root).",
+            "address (requires root). Flushing the old address drops the routes "
+            "that depended on it (the default gateway, static routes); they are "
+            "restored automatically unless --no-preserve is given.",
             _make_ip_handler("set", version),
-            [name_param, addr_one, gw_param],
+            [name_param, addr_one, gw_param, no_preserve_param],
             [
                 f"interface {fam} set eth0 {example_addr}",
                 f"interface {fam} set eth0 {example_addr} --gateway {example_gw}",
+                f"interface {fam} set eth0 {example_addr} --no-preserve",
             ],
             requires_root=True,
         ))
@@ -197,15 +225,30 @@ def build_actions() -> list[Action]:
             "interface.mac",
             "Set MAC address",
             "Set a MAC address, or 'default' to restore the factory MAC "
-            "(requires root).",
+            "(requires root). The change requires briefly cycling the link, "
+            "which drops its routes (including the default gateway); they are "
+            "restored automatically unless --no-preserve is given. Note: on a "
+            "virtualized NIC (e.g. WSL2/Hyper-V), the underlying virtual "
+            "switch may still reject traffic from a non-original MAC even "
+            "though routing stays intact - that is a host-side setting, not "
+            "something this tool controls.",
             _set_mac,
             [
                 Param("name", "Interface name (e.g. eth0)", multiple=True),
                 Param("mac", "New MAC (00:11:22:33:44:55) or 'default'"),
+                Param(
+                    "no-preserve",
+                    "Skip restoring routes dropped by the link cycle",
+                    bool,
+                    required=False,
+                    default=False,
+                    is_flag=True,
+                ),
             ],
             [
                 "interface mac eth0 02:11:22:33:44:55",
                 "interface mac eth0 default",
+                "interface mac eth0 02:11:22:33:44:55 --no-preserve",
             ],
             requires_root=True,
         ),
