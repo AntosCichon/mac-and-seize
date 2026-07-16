@@ -11,14 +11,24 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from mac_and_seize.core.actions import Action, Param
+from mac_and_seize.core.errors import ModuleError
+from mac_and_seize.core.presenter import Column
 from mac_and_seize.modules.capture.filters import FIELDS
-from mac_and_seize.modules.capture.inspect import run_inspector
 
 if TYPE_CHECKING:
     from mac_and_seize.core.context import AppContext
     from mac_and_seize.modules.capture.service import CaptureService
 
 SERVICE = "capture"
+
+# Column layout for the `inspect` table; source/destination flex to fill width.
+_INSPECT_COLUMNS = [
+    Column("timestamp", "timestamp", 10),
+    Column("interface", "interface", 12),
+    Column("source", "source", 30, flex=True),
+    Column("destination", "destination", 30, flex=True),
+    Column("layer", "layer", 12),
+]
 
 GROUP_DESCRIPTIONS = {
     "capture": "Capture, filter and inspect packets",
@@ -82,8 +92,10 @@ def _summary(context: "AppContext", values: dict) -> dict:
 
 
 def _inspect(context: "AppContext", values: dict) -> None:
-    service = _service(context)
-    run_inspector(service.inspect_rows())
+    rows = _service(context).inspect_rows()
+    if not rows:
+        raise ModuleError("No packets captured yet; run 'capture start' first.")
+    context.presenter.table(rows, _INSPECT_COLUMNS, title="Captured packets")
     return None
 
 

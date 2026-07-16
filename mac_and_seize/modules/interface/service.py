@@ -1,65 +1,20 @@
-"""Business operations on network interfaces (the module's service layer)."""
+"""Business operations on network interfaces (the module's service layer).
+
+An application-layer orchestrator over the shared network domain
+(:mod:`mac_and_seize.net`): it parses input into value objects, composes the
+``ip``/``ethtool``/``netifaces`` adapters to build and mutate
+:class:`~mac_and_seize.net.model.interface.Interface` entities, and owns the
+module's cross-cutting workflow (the interface registry, id assignment, and the
+route-preservation sequencing for MAC/address changes).
+"""
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
-from ipaddress import (
-    IPv4Address,
-    IPv4Interface,
-    IPv6Address,
-    IPv6Interface,
-)
 
-from mac_and_seize.modules.interface.net import (
-    Interface,
-    add_ip_address,
-    capture_routes,
-    get_permanent_mac,
-    interface_names,
-    remove_ip_address,
-    restore_routes,
-    set_default_gateway,
-    set_ip_address,
-    set_link_state,
-    set_mac_address,
-)
+from mac_and_seize.net import CIDR, IPAddress, Interface, MacAddress, Route
+from mac_and_seize.net.adapters import ethtool, ip, netifaces_io
 from mac_and_seize.observability import get_logger
-
-_MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){5}$")
-
-
-def _normalize_mac(mac: str) -> str:
-    """Validate and normalize a MAC address to lowercase colon form."""
-    candidate = mac.strip()
-    if not _MAC_RE.match(candidate):
-        raise ValueError(
-            f"Invalid MAC address {mac!r}; expected 6 hex octets like "
-            "'00:11:22:33:44:55' (or 'default' to restore the factory MAC)."
-        )
-    return candidate.replace("-", ":").lower()
-
-
-def _normalize_ip(address: str, version: int) -> str:
-    """Validate an IPv4/IPv6 CIDR address and return its canonical form.
-
-    A bare address without a prefix defaults to /32 (IPv4) or /128 (IPv6).
-    Raises :class:`ValueError` for malformed input or a family mismatch.
-    """
-    factory = IPv4Interface if version == 4 else IPv6Interface
-    try:
-        return factory(address.strip()).with_prefixlen
-    except ValueError as exc:
-        raise ValueError(f"Invalid IPv{version} address {address!r}: {exc}") from exc
-
-
-def _normalize_gateway(gateway: str, version: int) -> str:
-    """Validate a bare (prefix-less) IPv4/IPv6 gateway address."""
-    factory = IPv4Address if version == 4 else IPv6Address
-    try:
-        return str(factory(gateway.strip()))
-    except ValueError as exc:
-        raise ValueError(f"Invalid IPv{version} gateway {gateway!r}: {exc}") from exc
 
 
 @dataclass
@@ -84,13 +39,21 @@ class InterfaceService:
         self._next_id = 0
 
     def list_names(self) -> list[str]:
-        return interface_names()
+        return netifaces_io.list_names()
+
+    def _load(self, iface: Interface) -> None:
+        """Refresh an entity's live link state and address records in place."""
+        iface.state = ip.read_state(iface.name)
+        iface.ipv4, iface.ipv6, iface.mac = netifaces_io.read_addresses(iface.name)
 
     def get(self, name: str) -> Interface:
         """Return a cached :class:`Interface`, creating it on first access."""
         iface = self._registry.get(name)
         if iface is None:
-            iface = Interface(name, iface_id=self._next_id)
+            if name not in netifaces_io.list_names():
+                raise ValueError(f"Interface {name!r} does not exist.")
+            iface = Interface(name, id=self._next_id)
+            self._load(iface)
             self._next_id += 1
             self._registry[name] = iface
             self._log.info("Initialized interface %s (id=%s)", name, iface.id)
@@ -98,22 +61,27 @@ class InterfaceService:
 
     def inspect(self, name: str) -> dict:
         iface = self.get(name)
-        iface.refresh_addresses()
-        iface.state = iface.get_state()
+        self._load(iface)
         return iface.to_dict()
 
     def set_state(self, name: str, state: str) -> str:
         iface = self.get(name)
-        previous = iface.get_state()
-        result = iface.set_state(state)
+        if state not in ("up", "down"):
+            raise ValueError(
+                f"Invalid state {state!r} for interface {name!r}."
+            )
+        previous = ip.read_state(name)
+        if previous != state:
+            ip.set_link_state(name, state)
+        iface.state = ip.read_state(name)
         self._log.info(
             "Interface %s state change requested: %s -> %s (now %s)",
             name,
             previous,
             state,
-            result,
+            iface.state,
         )
-        return result
+        return iface.state
 
     def set_mac(
         self, name: str, mac: str, *, preserve_routes: bool = True
@@ -131,7 +99,7 @@ class InterfaceService:
         iface = self.get(name)
 
         if mac.strip().lower() == "default":
-            permanent = get_permanent_mac(name)
+            permanent = ethtool.get_permanent_mac(name)
             if permanent is None:
                 raise ValueError(
                     f"Could not determine the factory MAC address for {name!r} "
@@ -141,36 +109,38 @@ class InterfaceService:
             target = permanent
             self._log.info("Resolved factory MAC for %s: %s", name, target)
         else:
-            target = _normalize_mac(mac)
+            target = MacAddress.parse(mac)
 
-        previous_state = iface.get_state()
+        previous_state = ip.read_state(name)
         # The link cycle drops routes for both families, so snapshot both.
         routes = (
-            capture_routes(name) if preserve_routes and previous_state != "down" else []
+            ip.capture_routes(name)
+            if preserve_routes and previous_state != "down"
+            else []
         )
-        set_link_state(name, "down")
+        ip.set_link_state(name, "down")
         try:
-            set_mac_address(name, target)
+            ip.set_mac_address(name, target)
         finally:
             if previous_state != "down":
-                set_link_state(name, "up")
+                ip.set_link_state(name, "up")
 
         restored = failed = 0
         if routes:
             restored, failed = self._preserve(name, routes)
 
-        iface.refresh_addresses()
-        iface.state = iface.get_state()
+        self._load(iface)
         self._log.info("Set MAC of %s to %s", name, target)
-        return MacChangeResult(target, restored, failed)
+        return MacChangeResult(str(target), restored, failed)
 
-    def _preserve(self, name: str, routes: list[dict]) -> tuple[int, int]:
+    def _preserve(self, name: str, routes: list[Route]) -> tuple[int, int]:
         """Reinstall snapshotted routes and log the outcome; return the counts.
 
-        Thin wrapper over :func:`restore_routes` (which does the actual filtering
-        and best-effort re-application) that records how many routes came back.
+        Thin wrapper over :func:`mac_and_seize.net.adapters.ip.restore_routes`
+        (which does the actual filtering and best-effort re-application) that
+        records how many routes came back.
         """
-        restored, failed = restore_routes(name, routes)
+        restored, failed = ip.restore_routes(name, routes)
         if failed:
             self._log.warning(
                 "Restored %d/%d route(s) on %s; %d could not be reinstalled",
@@ -189,21 +159,21 @@ class InterfaceService:
         ``None`` when no gateway was requested.
         """
         iface = self.get(name)
-        normalized = _normalize_ip(address, version)
-        add_ip_address(name, normalized, version)
+        cidr = CIDR.parse(address, version)
+        ip.add_ip_address(name, cidr)
         gw = self._apply_gateway(name, gateway, version)
-        iface.refresh_addresses()
-        self._log.info("Added IPv%d %s to %s", version, normalized, name)
-        return normalized, gw
+        self._load(iface)
+        self._log.info("Added IPv%d %s to %s", version, cidr, name)
+        return str(cidr), gw
 
     def remove_ip(self, name: str, address: str, version: int) -> str:
         """Remove an IPv4/IPv6 address from the interface; returns the CIDR."""
         iface = self.get(name)
-        normalized = _normalize_ip(address, version)
-        remove_ip_address(name, normalized, version)
-        iface.refresh_addresses()
-        self._log.info("Removed IPv%d %s from %s", version, normalized, name)
-        return normalized
+        cidr = CIDR.parse(address, version)
+        ip.remove_ip_address(name, cidr)
+        self._load(iface)
+        self._log.info("Removed IPv%d %s from %s", version, cidr, name)
+        return str(cidr)
 
     def set_ip(
         self,
@@ -222,21 +192,22 @@ class InterfaceService:
         routes for that family are, by default, snapshotted first and re-applied
         afterwards on a best-effort basis - so connectivity is preserved when the
         new address is in the same subnet (shared with ``set_mac`` via
-        :func:`restore_routes`). Pass ``preserve_routes=False`` to skip this. An
-        explicit ``gateway`` still wins over a restored default route. Returns
+        :func:`mac_and_seize.net.adapters.ip.restore_routes`). Pass
+        ``preserve_routes=False`` to skip this. An explicit ``gateway`` still
+        wins over a restored default route. Returns
         ``(applied_cidr, applied_gateway, routes_restored, routes_failed)``.
         """
         iface = self.get(name)
-        normalized = _normalize_ip(address, version)
-        routes = capture_routes(name, version) if preserve_routes else []
-        set_ip_address(name, normalized, version)
+        cidr = CIDR.parse(address, version)
+        routes = ip.capture_routes(name, version) if preserve_routes else []
+        ip.set_ip_address(name, cidr)
         restored = failed = 0
         if routes:
             restored, failed = self._preserve(name, routes)
         gw = self._apply_gateway(name, gateway, version)
-        iface.refresh_addresses()
-        self._log.info("Set IPv%d of %s to %s", version, name, normalized)
-        return normalized, gw, restored, failed
+        self._load(iface)
+        self._log.info("Set IPv%d of %s to %s", version, name, cidr)
+        return str(cidr), gw, restored, failed
 
     def _apply_gateway(
         self, name: str, gateway: str | None, version: int
@@ -244,12 +215,12 @@ class InterfaceService:
         """Install a default gateway if one was requested; return the applied IP."""
         if not gateway:
             return None
-        normalized = _normalize_gateway(gateway, version)
-        set_default_gateway(name, normalized, version)
+        gw = IPAddress.parse(gateway, version)
+        ip.set_default_gateway(name, gw)
         self._log.info(
-            "Set IPv%d default gateway via %s on %s", version, normalized, name
+            "Set IPv%d default gateway via %s on %s", version, gw, name
         )
-        return normalized
+        return str(gw)
 
     def list_details(self) -> list[dict]:
         return [self.inspect(name) for name in self.list_names()]

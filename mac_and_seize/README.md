@@ -9,13 +9,18 @@ localhost web interface planned to sit alongside it on the same backend.
 mac_and_seize/
   __main__.py            entry point for `python -m mac_and_seize`
   cli/                    Typer app and interactive shell (front-end)
-  core/                   framework-agnostic primitives: actions, context, plugin discovery
+  core/                   framework-agnostic primitives: actions, context, presenter, plugin discovery
   modules/                feature modules (interface, capture, ...)
+  net/                    shared network domain: model (entities/value objects) + adapters (ip/scapy/ioctl)
   config/                 configuration models and loader
   observability/          logging setup
   server/                 stub for the planned web interface
-  util/                   internal helpers (system, export, static data)
+  util/                   internal helpers (system, export, formatting, static data)
 ```
+
+Dependency direction: `cli`/`server` → `modules` → `net` → `core`. Feature
+modules are independent plugins that never import one another; anything more than
+one module needs (interfaces, packets, addresses, OS access) lives in `net/`.
 
 ### `cli/`
 
@@ -37,8 +42,9 @@ from `cli` or `server`.
 | --- | --- |
 | `actions.py` | `Action` and `Param` — the declarative, front-end-agnostic description of a command: name, parameters, handler, examples, root requirement. |
 | `plugins.py` | `discover_modules()` and `ModuleSpec` — imports every subpackage of `modules/` and collects each one's `register()` output. |
-| `context.py` | `AppContext` — the application's shared state (config, timer, services, actions), built once at startup and threaded explicitly through the app. |
+| `context.py` | `AppContext` — the application's shared state (config, timer, services, actions, presenter), built once at startup and threaded explicitly through the app. |
 | `errors.py` | `ModuleError`, the base exception type modules raise for expected operational failures. |
+| `presenter.py` | `Presenter` port + `Column` + `NullPresenter` — how a front-end supplies interactive views (e.g. a scrollable table) so modules render them without importing a front-end. |
 
 ### `modules/`
 
@@ -49,17 +55,33 @@ Self-contained, auto-discovered feature packages. See
 
 | File | Purpose |
 | --- | --- |
-| `net.py` | Low-level, privileged operations (`ip` subprocess calls, a raw `SIOCETHTOOL` ioctl for the factory MAC) and the `Interface` domain entity. |
-| `service.py` | `InterfaceService` — validates and normalizes input, caches `Interface` instances, exposes the module's API. |
+| `service.py` | `InterfaceService` — parses input into `net` value objects, composes the `ip`/`ethtool`/`netifaces` adapters to build and mutate `Interface` entities, owns the registry and route-preservation workflow. |
 | `actions.py` | The `interface` command tree: `list`, `show`, `state.up/down`, `mac`, `ip4.add/remove/set`, `ip6.add/remove/set`. |
 
 **`capture/`** — sniff and record packets.
 
 | File | Purpose |
 | --- | --- |
-| `net.py` | `Packet`, a wrapper around scapy packets (ARP/ICMP/TCP/UDP factories, layer access, summaries), and `write_pcap()`. |
-| `service.py` | `CaptureService` — `sniff()` and `send()` over scapy, plus `write_pcap()`. |
-| `actions.py` | The top-level `capture` command. |
+| `service.py` | `CaptureService` — session store (packets, filters), background `AsyncSniffer` lifecycle, pcap export/import; uses `net.adapters.scapy_io` and the shared `Packet`. |
+| `filters.py` | Structured include/exclude capture filters and the per-packet matching engine. |
+| `actions.py` | The `capture` command group (start/stop/export/import/clear/summary/inspect + `filter` subgroup). |
+
+### `net/`
+
+Shared network domain layer (see [`net/README.md`](net/README.md) for the
+model/adapters split and dependency rule).
+
+| File | Purpose |
+| --- | --- |
+| `model/addresses.py` | `MacAddress`, `IPAddress`, `CIDR` — self-validating address value objects. |
+| `model/route.py` | `Route` — a routing-table entry value object. |
+| `model/interface.py` | `Interface` — the pure interface entity (data + `to_dict`, no I/O). |
+| `model/packet.py` | `Packet` — the scapy packet wrapper (factories, layer access, summaries). |
+| `adapters/ip.py` | Link/address/route operations via `ip`, plus sysfs `read_state`/`is_up`. |
+| `adapters/ethtool.py` | `get_permanent_mac()` via a raw `SIOCETHTOOL` ioctl. |
+| `adapters/netifaces_io.py` | Interface enumeration and address records via `netifaces`. |
+| `adapters/scapy_io.py` | `send()`, `sniff()`, `write_pcap()`, `read_pcap()`, `available_interfaces()`. |
+| `adapters/privileged.py` | `run()` (privileged-subprocess helper), `PrivilegedCommandError`, `family_flag()`. |
 
 ### `config/`
 
@@ -86,6 +108,7 @@ Self-contained, auto-discovered feature packages. See
 | --- | --- |
 | `system.py` | `is_root()`, `relaunch_as_root()`. |
 | `export.py` | `archive()` and `export_logs()` — zips log files into the export directory. |
+| `format.py` | `format_hms()` — render a duration in seconds as `HH:MM:SS`. |
 | `static.py` | ANSI color codes, log-level colors, and the startup banner. |
 
 ## Wiring
@@ -108,9 +131,11 @@ the actions' dotted names and reads commands from the user. Dispatching a
 command parses its arguments against the action's declared `Param`s, then
 calls `action.run(context, values)`, which invokes the module's handler. A
 handler fetches its module's service with `context.service(key)`, calls into
-the module's `service.py`, which in turn drives the module's low-level
-`net.py`. Handlers return plain `str` / `dict` / `list` data, which the shell
-renders generically as a line, table, or numbered list.
+the module's `service.py`, which in turn drives the shared `net/` layer (domain
+model + OS/scapy adapters). Handlers return plain `str` / `dict` / `list` data,
+which the shell renders generically as a line, table, or numbered list; an
+interactive view (e.g. `capture inspect`) instead goes through
+`context.presenter`.
 
 Modules raise `ValueError` for invalid input and `core.errors.ModuleError`
 (or a subclass) for operational failures; the shell catches both and prints a

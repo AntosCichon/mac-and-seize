@@ -25,11 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
-
-def _format_hms(seconds: float) -> str:
-    """Render a duration as ``HH:MM:SS``."""
-    total = int(seconds)
-    return f"{total // 3600:02d}:{(total % 3600) // 60:02d}:{total % 60:02d}"
+from mac_and_seize.util.format import format_hms
 
 
 @dataclass
@@ -53,7 +49,7 @@ class Task:
 
     def runtime(self, *, now: datetime | None = None) -> str:
         reference = now or datetime.now(self.started_at.tzinfo)
-        return _format_hms((reference - self.started_at).total_seconds())
+        return format_hms((reference - self.started_at).total_seconds())
 
     def started(self) -> str:
         return self.started_at.strftime("%H:%M:%S")

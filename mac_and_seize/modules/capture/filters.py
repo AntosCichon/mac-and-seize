@@ -23,6 +23,8 @@ from scapy.layers.inet import ICMP, IP, TCP, UDP
 from scapy.layers.inet6 import IPv6
 from scapy.layers.l2 import ARP, Ether
 
+from mac_and_seize.net.adapters import ip
+
 # --- Vocabulary (also used to validate user input) ---
 
 ACTIONS = ("include", "exclude")
@@ -156,20 +158,24 @@ def select_interfaces(filters: list[Filter], available: list[str]) -> list[str]:
     """Resolve which interfaces to sniff from the ``interface`` filters.
 
     Include filters pick the NIC set (defaulting to everything available);
-    exclude filters remove NICs from it. Because scapy tags packets with their
+    exclude filters remove NICs from it. Either way, interfaces that are
+    currently down are dropped: opening a raw socket on a down interface fails
+    with ``ENETDOWN`` and would otherwise abort the whole capture, even when the
+    other selected interfaces are fine. Because scapy tags packets with their
     interface only *after* ``lfilter``, this socket-level selection is how the
     interface field is honoured.
     """
     includes = [f.value for f in filters if f.field == "interface" and f.action == "include"]
     excludes = {f.value for f in filters if f.field == "interface" and f.action == "exclude"}
     base = includes if includes else list(available)
-    # Preserve order, drop excluded and duplicates.
+    # Preserve order, drop excluded, down, and duplicate interfaces.
     seen: set[str] = set()
     selected = []
     for name in base:
-        if name not in excludes and name not in seen:
-            seen.add(name)
-            selected.append(name)
+        if name in excludes or name in seen or not ip.is_up(name):
+            continue
+        seen.add(name)
+        selected.append(name)
     return selected
 
 

@@ -14,7 +14,7 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from scapy.all import AsyncSniffer, get_if_list, sniff, srp
+from scapy.all import AsyncSniffer
 
 from mac_and_seize.core.errors import ModuleError
 from mac_and_seize.modules.capture.filters import (
@@ -26,7 +26,8 @@ from mac_and_seize.modules.capture.filters import (
     select_interfaces,
     split_values,
 )
-from mac_and_seize.modules.capture.net import Packet, read_pcap, write_pcap
+from mac_and_seize.net import Packet
+from mac_and_seize.net.adapters import scapy_io
 from mac_and_seize.observability import get_logger
 
 if TYPE_CHECKING:
@@ -39,10 +40,11 @@ DEFAULT_EXPORT_DIR = Path("exports")
 
 
 class CaptureService:
-    """Packet send/sniff plus a per-session store of packets and filters.
+    """Background packet capture with a per-session store of packets and filters.
 
     Sniffing requires root; callers (the CLI) gate root-only actions before
-    running them.
+    running them. One-shot packet I/O (send/sniff/pcap) lives in the shared
+    scapy adapter (:mod:`mac_and_seize.net.adapters.scapy_io`).
     """
 
     def __init__(self) -> None:
@@ -86,7 +88,7 @@ class CaptureService:
             # set must be chosen up front. include -> those NICs; exclude ->
             # drop them from the available set; no interface filter -> all NICs.
             try:
-                available = get_if_list()
+                available = scapy_io.available_interfaces()
             except Exception:  # noqa: BLE001
                 available = []
             selected = select_interfaces(self.filters, available)
@@ -230,7 +232,7 @@ class CaptureService:
         if not path.is_file():
             raise ModuleError(f"File not found: {filename}.")
         try:
-            packets = read_pcap(str(path))
+            packets = scapy_io.read_pcap(str(path))
         except ModuleError:
             raise
         except Exception as exc:  # noqa: BLE001 - surface any read/parse failure cleanly
@@ -341,50 +343,14 @@ class CaptureService:
             if not value.isdigit() or not (0 <= int(value) <= 65535):
                 raise ValueError(f"Invalid port {value!r}; expected 0-65535.")
 
-    # --- Lower-level packet ops (unchanged) -----------------------------------
-
-    def send(self, iface_name: str, packet: Packet, *, timeout: int = 5):
-        """Send a packet and wait for a response at layer 2."""
-        pkt = packet.build() if isinstance(packet, Packet) else packet
-        self._log.info("Sending packet on %s: %s", iface_name, packet)
-        answered, unanswered = srp(
-            pkt, iface=iface_name, threaded=False, timeout=timeout, verbose=False
-        )
-        self._log.info(
-            "Send complete on %s: %d answered, %d unanswered",
-            iface_name,
-            len(answered),
-            len(unanswered),
-        )
-        return answered, unanswered
-
-    def sniff(
-        self,
-        iface_name: str,
-        *,
-        count: int = 0,
-        bpf_filter: str | None = None,
-        timeout: int | None = None,
-    ) -> list[Packet]:
-        """Capture packets synchronously (kept for programmatic/one-shot use)."""
-        self._log.info(
-            "Sniffing on %s (count=%s, filter=%s, timeout=%s)",
-            iface_name,
-            count,
-            bpf_filter,
-            timeout,
-        )
-        captured = sniff(
-            iface=iface_name, filter=bpf_filter, timeout=timeout, count=count
-        )
-        self._log.info("Captured %d packet(s) on %s", len(captured), iface_name)
-        return [Packet.from_scapy(pkt) for pkt in captured]
+    # --- pcap writing ---------------------------------------------------------
 
     def write_pcap(
         self, path: str | Path, packets: list[Packet], *, append: bool = True
     ) -> Path:
+        """Write packets to ``path`` (creating parent dirs); returns the path."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        write_pcap(str(path), packets, append=append)
+        scapy_io.write_pcap(str(path), packets, append=append)
         self._log.info("Wrote %d packet(s) to %s", len(packets), path)
         return path

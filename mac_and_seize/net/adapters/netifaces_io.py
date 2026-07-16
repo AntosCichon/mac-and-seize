@@ -1,0 +1,48 @@
+"""Read interface enumeration and address records via ``netifaces``.
+
+Produces the plain address-record dicts that populate an :class:`Interface`
+entity's ``ipv4``/``ipv6``/``mac`` fields (see
+:func:`mac_and_seize.net.model.interface.empty_record` for the shape).
+"""
+
+from __future__ import annotations
+
+import netifaces as ni
+
+from mac_and_seize.net.model.interface import (
+    IPV4_FIELDS,
+    IPV6_FIELDS,
+    MAC_FIELDS,
+    empty_record,
+)
+
+
+def list_names() -> list[str]:
+    """Return the names of all network interfaces on the host."""
+    return ni.interfaces()
+
+
+def _record(info_list: list[dict], fields: list[str]) -> dict:
+    record = {field: [entry.get(field) for entry in info_list] for field in fields}
+    record["count"] = len(info_list)
+    return record
+
+
+def read_addresses(name: str) -> tuple[dict, dict, dict]:
+    """Return ``(ipv4, ipv6, mac)`` address records for ``name``.
+
+    Each record maps its fields (``addr``, ``netmask``, ...) to a list of
+    per-address values, plus a ``count``. A family with no addresses yields the
+    empty record.
+    """
+    addrs = ni.ifaddresses(name)
+
+    def record(family: int, fields: list[str]) -> dict:
+        info = addrs.get(family)
+        return _record(info, fields) if info else empty_record(fields)
+
+    return (
+        record(ni.AF_INET, IPV4_FIELDS),
+        record(ni.AF_INET6, IPV6_FIELDS),
+        record(ni.AF_LINK, MAC_FIELDS),
+    )

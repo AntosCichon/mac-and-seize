@@ -1,4 +1,10 @@
-"""A thin, ergonomic wrapper around scapy packets (capture module)."""
+"""A thin, ergonomic wrapper around scapy packets.
+
+The :class:`Packet` domain type represents a single network packet: constructing
+one (the ARP/ICMP/TCP/UDP factories), inspecting its layers, and rendering it for
+display. It performs no network I/O - sending, sniffing, and reading/writing pcap
+files live in the scapy adapter (``net.adapters.scapy_io``).
+"""
 
 from __future__ import annotations
 
@@ -8,7 +14,6 @@ from scapy.layers.l2 import ARP, Dot1Q, Ether  # noqa: F401 (Dot1Q re-exported)
 from scapy.layers.inet import ICMP, IP, TCP, UDP
 from scapy.layers.inet6 import IPv6
 from scapy.packet import Raw
-from scapy.utils import rdpcap, wrpcap
 
 _IGNORED_LAYERS = {"Raw", "Padding", "NoPayload"}
 
@@ -231,16 +236,3 @@ class Packet:
 
     def __repr__(self) -> str:
         return f"Packet({self._pkt.summary()})"
-
-
-def write_pcap(filename: str, packets: list, append: bool = True) -> None:
-    wrpcap(
-        filename,
-        [p.pcap() if isinstance(p, Packet) else p for p in packets],
-        append=append,
-    )
-
-
-def read_pcap(filename: str) -> list["Packet"]:
-    """Read a pcap file, returning wrapped :class:`Packet`s."""
-    return [Packet.from_scapy(pkt) for pkt in rdpcap(filename)]

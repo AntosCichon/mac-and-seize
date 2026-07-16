@@ -19,7 +19,9 @@ from datetime import datetime, timedelta, timezone
 from mac_and_seize.config import AppConfig
 from mac_and_seize.core.actions import Action
 from mac_and_seize.core.plugins import discover_modules
+from mac_and_seize.core.presenter import NullPresenter, Presenter
 from mac_and_seize.core.tasks import TaskManager
+from mac_and_seize.util.format import format_hms
 
 
 class Timer:
@@ -39,8 +41,7 @@ class Timer:
         if fmt == "seconds":
             return "%.2f" % delta
         if fmt == "time":
-            s = int(delta)
-            return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+            return format_hms(delta)
         return str(delta)
 
     def start_measure(self) -> int:
@@ -58,6 +59,10 @@ class AppContext:
     actions: list[Action] = field(init=False)
     group_descriptions: dict[str, str] = field(init=False)
     tasks: TaskManager = field(init=False)
+    #: Interactive-rendering capability supplied by the front-end (see
+    #: :mod:`mac_and_seize.core.presenter`). Defaults to a no-op presenter that
+    #: refuses interactive views; a front-end replaces it after construction.
+    presenter: Presenter = field(init=False)
     #: Full invocation string of the command currently running (set by the
     #: front-end before a handler runs), so background tasks can record exactly
     #: what was invoked. Empty when no command is executing.
@@ -68,6 +73,7 @@ class AppContext:
         self.actions = []
         self.group_descriptions = {}
         self.tasks = TaskManager(self.timer.timezone)
+        self.presenter = NullPresenter()
         for spec in discover_modules():
             for key, factory in spec.services.items():
                 if key in self.services:

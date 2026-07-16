@@ -19,6 +19,7 @@ from pydantic import ValidationError
 
 from mac_and_seize.cli.commands.serve import serve
 from mac_and_seize.cli.interactive import run_interactive
+from mac_and_seize.cli.tui import CursesPresenter
 from mac_and_seize.config import load_config
 from mac_and_seize.core.context import AppContext
 from mac_and_seize.observability import configure_logging, get_logger
@@ -77,6 +78,7 @@ def main(
 
     configure_logging(cfg)
     ctx.obj = AppContext.create(cfg)
+    ctx.obj.presenter = CursesPresenter()
 
     if sys.stderr.isatty():
         typer.echo(f"{COLORS['yellow']}{WELCOME_ART}{COLORS['reset']}", err=True)

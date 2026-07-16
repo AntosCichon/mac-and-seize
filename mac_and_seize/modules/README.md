@@ -44,13 +44,21 @@ mac_and_seize/modules/
     __init__.py     # MUST define register() -> ModuleSpec
     service.py      # your business logic (a plain class)
     actions.py      # Action definitions + thin handlers
-    <anything>.py   # e.g. net.py, hardware.py — your internals
+    <anything>.py   # e.g. hardware.py — your module-specific internals
 ```
 
 Only `__init__.py` with `register()` is strictly required; the `service.py` /
 `actions.py` split is the convention used by existing modules and keeps handlers
-thin. Put all private helpers, system calls, and third-party imports inside your
-module folder — do **not** add code to `core/` or `cli/`.
+thin. Put your **module-specific** private helpers and third-party imports inside
+your module folder — do **not** add code to `core/` or `cli/`, and **never import
+another module**.
+
+Shared network vocabulary and OS access do **not** belong in your module: the
+domain types (`Interface`, `Packet`, `MacAddress`, `IPAddress`, `CIDR`, `Route`)
+and the OS/scapy adapters (`ip`, `ethtool`, `scapy_io`, the privileged-subprocess
+`run` helper) live in the shared [`net/`](../net/README.md) layer. Import them from
+`mac_and_seize.net`; that is how two modules share types without importing each
+other (see §8).
 
 ---
 
@@ -258,11 +266,25 @@ continues.
 
 ---
 
-## 8. Dependencies
+## 8. Dependencies and the shared `net/` layer
 
 If your module needs a third-party package, add it to `[project.dependencies]`
 in the repo-root `pyproject.toml` and install it (`uv add <pkg>` /
 `uv sync`). Import it **inside your module** only.
+
+The one exception to "keep everything in your folder" is **shared network
+domain code**, which lives in [`mac_and_seize/net/`](../net/README.md) — a layer
+*below* the modules:
+
+- **model** (pure types): `Interface`, `Packet`, `MacAddress`, `IPAddress`,
+  `CIDR`, `Route` — `from mac_and_seize.net import ...`.
+- **adapters** (OS/scapy access): `from mac_and_seize.net.adapters import ip,
+  ethtool, scapy_io` and `from mac_and_seize.net.adapters.privileged import run`.
+
+Because modules must never import one another, any type or OS operation more than
+one feature needs belongs in `net/`, not in a peer module. If you find yourself
+wanting to import from another module, that code should move down into `net/`
+(model if it's a pure type, adapters if it touches the OS/scapy).
 
 ---
 
@@ -320,31 +342,18 @@ saving them, run the app — `bluetooth` appears in `help` automatically.
 
 ### `bluetooth/hardware.py` — low-level calls (your internals)
 
+Reuse the shared privileged-subprocess helper from `net/` instead of
+re-implementing it — it already runs an argument list (never a shell string),
+surfaces a clean `PrivilegedCommandError`, and reports a missing binary.
+
 ```python
 """Thin wrappers over `bluetoothctl` (argument lists, never a shell string)."""
 from __future__ import annotations
-import subprocess
-from mac_and_seize.core.errors import ModuleError
-
-
-class BluetoothError(ModuleError):
-    """A bluetoothctl command failed or is unavailable."""
-
-
-def _run(args: list[str]) -> str:
-    try:
-        proc = subprocess.run(
-            ["bluetoothctl", *args], check=True, capture_output=True, text=True
-        )
-    except FileNotFoundError as exc:
-        raise BluetoothError("`bluetoothctl` not found; is BlueZ installed?") from exc
-    except subprocess.CalledProcessError as exc:
-        raise BluetoothError((exc.stderr or "").strip() or "command failed") from exc
-    return proc.stdout
+from mac_and_seize.net.adapters.privileged import run
 
 
 def scan(seconds: int) -> list[dict]:
-    out = _run(["--timeout", str(seconds), "scan", "on"])
+    out = run(["bluetoothctl", "--timeout", str(seconds), "scan", "on"]).stdout
     devices = []
     for line in out.splitlines():
         parts = line.split()
@@ -354,8 +363,12 @@ def scan(seconds: int) -> list[dict]:
 
 
 def pair(mac: str) -> None:
-    _run(["pair", mac])
+    run(["bluetoothctl", "pair", mac])
 ```
+
+`run` raises `PrivilegedCommandError` (a `ModuleError` subclass) on failure, so
+front-ends already render it cleanly. Define your own `ModuleError` subclass and
+catch/re-raise only if you want module-specific wording.
 
 ### `bluetooth/service.py` — business logic + validation
 
@@ -476,4 +489,7 @@ That's it. No edits anywhere else. Launch the app and try `bluetooth help`,
 - [ ] Bad input raises `ValueError`; operational failures raise `ModuleError`.
 - [ ] `group_descriptions` added for each group (optional but recommended).
 - [ ] Any new third-party dependency added to root `pyproject.toml`.
-- [ ] No edits to `core/`, `cli/`, or other modules.
+- [ ] Shared domain types / OS access imported from `mac_and_seize.net`, not redefined.
+- [ ] No edits to `core/`, `cli/`, or other modules; no imports from another module.
+- [ ] Need an interactive view (a scrollable table)? Call `context.presenter`
+      (see `core/presenter.py`) instead of importing the CLI.
