@@ -13,9 +13,11 @@ from ipaddress import (
 from mac_and_seize.modules.interface.net import (
     Interface,
     add_ip_address,
+    get_device_routes,
     get_permanent_mac,
     interface_names,
     remove_ip_address,
+    restore_routes,
     set_default_gateway,
     set_ip_address,
     set_link_state,
@@ -169,11 +171,23 @@ class InterfaceService:
         """Replace the interface's IPv4/IPv6 address(es) with a single address.
 
         Existing addresses of the same family are flushed before the new one is
-        added. Returns ``(applied_cidr, applied_gateway)``.
+        added. Because flushing an address also tears down the routes that
+        depended on it (the default gateway, static routes), the interface's
+        routes are captured first and re-applied afterwards on a best-effort
+        basis - so connectivity is preserved when the new address is in the same
+        subnet. An explicit ``gateway`` still wins over a restored default route.
+        Returns ``(applied_cidr, applied_gateway)``.
         """
         iface = self.get(name)
         normalized = _normalize_ip(address, version)
+        preserved = get_device_routes(name, version)
         set_ip_address(name, normalized, version)
+        restored = restore_routes(name, version, preserved)
+        if restored:
+            self._log.info(
+                "Restored %d route(s) on %s after set: %s",
+                len(restored), name, restored,
+            )
         gw = self._apply_gateway(name, gateway, version)
         iface.refresh_addresses()
         self._log.info("Set IPv%d of %s to %s", version, name, normalized)

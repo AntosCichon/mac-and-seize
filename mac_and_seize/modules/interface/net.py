@@ -98,6 +98,76 @@ def set_ip_address(name: str, address: str, version: int) -> None:
     _run(["ip", "addr", "add", address, "dev", name])
 
 
+# Tokens ``ip route show`` prints as status but ``ip route replace`` rejects.
+_ROUTE_STATUS_FLAGS = {"linkdown", "dead"}
+
+
+def get_device_routes(name: str, version: int) -> list[str]:
+    """Return the routes currently attached to an interface (one spec per line).
+
+    Output mirrors ``ip -<v> route show dev <name>`` (the ``dev <name>`` clause
+    is implied and therefore omitted from each line).
+    """
+    flag = _family_flag(version)
+    result = _run(["ip", flag, "route", "show", "dev", name])
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def _route_replace_args(spec: str, name: str) -> list[str] | None:
+    """Convert a captured route line into ``ip route replace`` arguments.
+
+    Returns ``None`` for kernel-managed connected routes (the kernel recreates
+    those for the new address). A stale ``src <addr>`` clause is dropped so the
+    kernel picks a valid source, status-only flags are removed, and ``dev`` is
+    re-attached (``ip route show dev`` omits it).
+    """
+    tokens = spec.split()
+    if "proto" in tokens:
+        proto = tokens[tokens.index("proto") + 1 : tokens.index("proto") + 2]
+        if proto == ["kernel"] and "via" not in tokens:
+            return None
+
+    args: list[str] = []
+    skip_next = False
+    for token in tokens:
+        if skip_next:
+            skip_next = False
+            continue
+        if token == "src":  # drop 'src <addr>' - source may no longer be valid
+            skip_next = True
+            continue
+        if token in _ROUTE_STATUS_FLAGS:
+            continue
+        args.append(token)
+    if "dev" not in args:
+        args += ["dev", name]
+    return args
+
+
+def restore_routes(name: str, version: int, routes: list[str]) -> list[str]:
+    """Best-effort re-application of routes captured before an address change.
+
+    Used by ``set`` to preserve connectivity: the default gateway and other
+    routes that were valid beforehand are reinstalled after the new address is
+    added. Kernel-managed connected routes are skipped (auto-recreated), and any
+    route that can no longer be installed - e.g. its gateway is off-link because
+    the new address is in a different subnet - is skipped instead of failing the
+    whole operation. Returns the specs that were successfully restored.
+    """
+    flag = _family_flag(version)
+    restored: list[str] = []
+    for spec in routes:
+        args = _route_replace_args(spec, name)
+        if args is None:
+            continue
+        try:
+            _run(["ip", flag, "route", "replace", *args])
+        except PrivilegedCommandError:
+            continue
+        restored.append(spec)
+    return restored
+
+
 def set_default_gateway(name: str, gateway: str, version: int) -> None:
     """Set (replace) the default route for a family via ``ip route replace``.
 
