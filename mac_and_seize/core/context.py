@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from mac_and_seize.config import AppConfig
 from mac_and_seize.core.actions import Action
 from mac_and_seize.core.plugins import discover_modules
+from mac_and_seize.core.tasks import TaskManager
 
 
 class Timer:
@@ -56,11 +57,17 @@ class AppContext:
     services: dict[str, object] = field(init=False)
     actions: list[Action] = field(init=False)
     group_descriptions: dict[str, str] = field(init=False)
+    tasks: TaskManager = field(init=False)
+    #: Full invocation string of the command currently running (set by the
+    #: front-end before a handler runs), so background tasks can record exactly
+    #: what was invoked. Empty when no command is executing.
+    current_command: str = field(init=False, default="")
 
     def __post_init__(self) -> None:
         self.services = {}
         self.actions = []
         self.group_descriptions = {}
+        self.tasks = TaskManager(self.timer.timezone)
         for spec in discover_modules():
             for key, factory in spec.services.items():
                 if key in self.services:

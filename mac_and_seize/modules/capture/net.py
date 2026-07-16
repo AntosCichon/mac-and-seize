@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from scapy.layers.l2 import ARP, Dot1Q, Ether  # noqa: F401 (Dot1Q re-exported)
 from scapy.layers.inet import ICMP, IP, TCP, UDP
 from scapy.layers.inet6 import IPv6
 from scapy.packet import Raw
-from scapy.utils import wrpcap
+from scapy.utils import rdpcap, wrpcap
+
+_IGNORED_LAYERS = {"Raw", "Padding", "NoPayload"}
 
 
 class Packet:
@@ -184,6 +188,47 @@ class Packet:
             result["payload"] = bytes(self._pkt[Raw].load)
         return result
 
+    def timestamp(self) -> str:
+        """Capture time as ``HH:MM:SS`` (``-`` if scapy did not record one)."""
+        epoch = getattr(self._pkt, "time", None)
+        if not epoch:
+            return "-"
+        return datetime.fromtimestamp(float(epoch)).strftime("%H:%M:%S")
+
+    def top_layer(self) -> str:
+        """Name of the outermost meaningful protocol layer (skips Raw/Padding)."""
+        name = "-"
+        for layer in self._pkt.layers():
+            candidate = layer.__name__
+            if candidate not in _IGNORED_LAYERS:
+                name = candidate
+        return name
+
+    def inspect_row(self) -> dict:
+        """Compact one-line view for the ``inspect`` table.
+
+        Columns: timestamp, capture interface, source and destination each as
+        ``mac / ip / port`` (missing parts shown as ``-``), and the top-level
+        protocol layer.
+        """
+        info = self.info()
+
+        def part(key: str) -> str:
+            value = info.get(key)
+            return "-" if value in (None, "") else str(value)
+
+        def endpoint(prefix: str) -> str:
+            return f"{part(prefix + '_mac')} / {part(prefix + '_ip')} / {part(prefix + '_port')}"
+
+        sniffed_on = getattr(self._pkt, "sniffed_on", None)
+        return {
+            "timestamp": self.timestamp(),
+            "interface": sniffed_on if sniffed_on else "-",
+            "source": endpoint("src"),
+            "destination": endpoint("dst"),
+            "layer": self.top_layer(),
+        }
+
     def __repr__(self) -> str:
         return f"Packet({self._pkt.summary()})"
 
@@ -194,3 +239,8 @@ def write_pcap(filename: str, packets: list, append: bool = True) -> None:
         [p.pcap() if isinstance(p, Packet) else p for p in packets],
         append=append,
     )
+
+
+def read_pcap(filename: str) -> list["Packet"]:
+    """Read a pcap file, returning wrapped :class:`Packet`s."""
+    return [Packet.from_scapy(pkt) for pkt in rdpcap(filename)]

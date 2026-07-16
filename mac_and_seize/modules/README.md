@@ -247,7 +247,54 @@ in the repo-root `pyproject.toml` and install it (`uv add <pkg>` /
 
 ---
 
-## 9. Complete worked example: a `bluetooth` module
+## 9. Stateful services & background tasks
+
+### Session state
+A service is instantiated **once per `AppContext`** and lives for the whole
+session, so it is the right place to keep state that must persist across
+commands (a list of results, cached handles, configuration built up over
+several commands). Store it on the instance (`self.items = []`) and mutate it
+from your handlers. If a background thread touches that state, guard it with a
+`threading.Lock`. The `capture` module does exactly this: it accumulates
+captured packets and filters on the service across many commands.
+
+### Long-running / background work
+Some actions must keep running while the user keeps typing (a capture, a long
+scan). Do **not** block the handler; instead spawn your own worker (a thread, or
+a library helper like scapy's `AsyncSniffer`) and register it with the shared
+task registry so it shows up in the top-level `tasks` command:
+
+```python
+def _start(context, values):
+    service = context.service("mymodule")
+    # context.current_command is the full invocation, e.g. "mymodule start --time 60",
+    # recorded by the front-end regardless of the current context.
+    task = context.tasks.start(context.current_command, stop=service.stop)
+    service.begin(...)                # kicks off the worker thread
+    return "Started in the background."
+
+def _stop(context, values):
+    context.service("mymodule").stop()   # your stop() calls context.tasks.finish(task)
+    return "Stopped."
+```
+
+`context.tasks` (a `TaskManager` from `mac_and_seize/core/tasks.py`) offers:
+
+- `start(command, stop=None) -> Task` — register a running task; `stop` is an
+  optional zero-arg callable used to ask the task to stop.
+- `finish(task)` — mark it done and drop it from the running set (call this when
+  the work actually ends, e.g. inside your `stop()`).
+- `running() -> list[Task]` — what the `tasks` command lists.
+
+Because the REPL is single-threaded, **do not print from a worker thread** (it
+corrupts the prompt). Return data from the command that *reads* the results
+(`stop`, `summary`, ...) instead, and finalize self-stopped work lazily on the
+next command. All of this uses only `context.tasks` / `context.current_command`
+— no shared file is edited to add a background-capable module.
+
+---
+
+## 10. Complete worked example: a `bluetooth` module
 
 Create `mac_and_seize/modules/bluetooth/` with the four files below. After
 saving them, run the app — `bluetooth` appears in `help` automatically.
@@ -399,7 +446,7 @@ That's it. No edits anywhere else. Launch the app and try `bluetooth help`,
 
 ---
 
-## 10. Checklist
+## 11. Checklist
 
 - [ ] New folder `mac_and_seize/modules/<name>/` with `__init__.py`.
 - [ ] `register()` returns a `ModuleSpec`.
