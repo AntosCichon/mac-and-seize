@@ -28,6 +28,18 @@ def _record(info_list: list[dict], fields: list[str]) -> dict:
     return record
 
 
+def _alias_netmask(entry: dict) -> dict:
+    """netifaces reports the netmask under ``netmask``; netifaces2 uses ``mask``."""
+    if "netmask" not in entry and "mask" in entry:
+        entry = {**entry, "netmask": entry["mask"]}
+    return entry
+
+
+# On Linux, netifaces2 reports link-layer (MAC) addresses under AF_PACKET
+# rather than AF_LINK (which it hardcodes to a Windows-only value).
+_MAC_FAMILIES = (ni.AF_LINK, getattr(ni, "AF_PACKET", None))
+
+
 def read_addresses(name: str) -> tuple[dict, dict, dict]:
     """Return ``(ipv4, ipv6, mac)`` address records for ``name``.
 
@@ -39,10 +51,18 @@ def read_addresses(name: str) -> tuple[dict, dict, dict]:
 
     def record(family: int, fields: list[str]) -> dict:
         info = addrs.get(family)
-        return _record(info, fields) if info else empty_record(fields)
+        if not info:
+            return empty_record(fields)
+        return _record([_alias_netmask(entry) for entry in info], fields)
+
+    def mac_record(fields: list[str]) -> dict:
+        info = next((addrs[fam] for fam in _MAC_FAMILIES if fam in addrs), None)
+        if not info:
+            return empty_record(fields)
+        return _record(info, fields)
 
     return (
         record(ni.AF_INET, IPV4_FIELDS),
         record(ni.AF_INET6, IPV6_FIELDS),
-        record(ni.AF_LINK, MAC_FIELDS),
+        mac_record(MAC_FIELDS),
     )
