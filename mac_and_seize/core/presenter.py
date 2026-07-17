@@ -18,6 +18,9 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from mac_and_seize.core.errors import ModuleError
+from mac_and_seize.observability import get_logger
+
+_log = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -42,6 +45,16 @@ class Presenter(Protocol):
         """Display ``rows`` as an interactive, scrollable table."""
         ...
 
+    def notify(self, message: str) -> None:
+        """Emit a best-effort status line outside the normal command/response
+        flow - e.g. a background task (a scan, a long capture) finishing while
+        the user is elsewhere in the session. Front-ends should show this
+        regardless of the current command context. Unlike :meth:`table`, this
+        is fire-and-forget: a front-end that cannot display it may drop it
+        (or log it) instead of raising.
+        """
+        ...
+
 
 class NullPresenter:
     """Default presenter: refuses interactive views.
@@ -53,3 +66,6 @@ class NullPresenter:
 
     def table(self, rows: list[dict], columns: list[Column], *, title: str) -> None:
         raise ModuleError("Interactive views are not available in this front-end.")
+
+    def notify(self, message: str) -> None:
+        _log.info(message)

@@ -1,9 +1,10 @@
 """Actions exposed by the capture module - a full ``capture`` command group.
 
-Commands: ``start`` / ``stop`` (background capture), ``export``, ``clear``,
-``summary``, ``inspect`` and a ``filter`` subgroup (``add`` / ``remove`` /
-``show``). Handlers stay thin: they translate parsed values into calls on the
-session-scoped :class:`CaptureService` and return plain data for rendering.
+Commands: ``start`` / ``stop`` (background capture), ``export``, ``import``,
+``clear``, ``summary``, ``inspect`` and a ``filter`` subgroup (``add`` /
+``remove`` / ``show``). Handlers stay thin: they translate parsed values into
+calls on the session-scoped :class:`CaptureService` and return plain data for
+rendering.
 """
 
 from __future__ import annotations
@@ -11,7 +12,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from mac_and_seize.core.actions import Action, Param
-from mac_and_seize.core.errors import ModuleError
 from mac_and_seize.core.presenter import Column
 from mac_and_seize.modules.capture.filters import FIELDS
 
@@ -91,10 +91,10 @@ def _summary(context: "AppContext", values: dict) -> dict:
     return _service(context).summary()
 
 
-def _inspect(context: "AppContext", values: dict) -> None:
+def _inspect(context: "AppContext", values: dict):
     rows = _service(context).inspect_rows()
     if not rows:
-        raise ModuleError("No packets captured yet; run 'capture start' first.")
+        return "No packets captured yet; run 'capture start' first."
     context.presenter.table(rows, _INSPECT_COLUMNS, title="Captured packets")
     return None
 

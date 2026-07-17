@@ -1,8 +1,8 @@
 """Capture module: background packet capture, filtering and inspection.
 
 Auto-discovered via :func:`register`. Registers one session-scoped service
-(``"capture"``) and the ``capture`` command group (start/stop/export/clear/
-summary/inspect plus a ``filter`` subgroup).
+(``"capture"``) and the ``capture`` command group (start/stop/export/import/
+clear/summary/inspect plus a ``filter`` subgroup).
 """
 
 from __future__ import annotations

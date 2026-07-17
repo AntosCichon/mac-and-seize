@@ -7,6 +7,8 @@ entity's ``ipv4``/``ipv6``/``mac`` fields (see
 
 from __future__ import annotations
 
+import ipaddress
+
 import netifaces as ni
 
 from mac_and_seize.net.model.interface import (
@@ -20,6 +22,30 @@ from mac_and_seize.net.model.interface import (
 def list_names() -> list[str]:
     """Return the names of all network interfaces on the host."""
     return ni.interfaces()
+
+
+def ipv4_networks(name: str) -> list[str]:
+    """Return the CIDR network(s) interface ``name`` is attached to.
+
+    Combines each IPv4 address of the interface with its netmask into the
+    containing network (``192.168.1.129`` + ``255.255.255.0`` ->
+    ``192.168.1.0/24``), so a scan can target "whatever subnet this NIC is on"
+    without the user spelling out the range. An interface with no usable IPv4
+    address yields an empty list; ``name`` must be a real interface (the caller
+    checks against :func:`list_names`). Addresses that don't parse are skipped.
+    """
+    ipv4, _, _ = read_addresses(name)
+    addrs = ipv4.get("addr") or []
+    masks = ipv4.get("netmask") or []
+    networks: list[str] = []
+    for addr, mask in zip(addrs, masks):
+        if not addr or not mask:
+            continue
+        try:
+            networks.append(str(ipaddress.ip_interface(f"{addr}/{mask}").network))
+        except ValueError:
+            continue
+    return networks
 
 
 def _record(info_list: list[dict], fields: list[str]) -> dict:

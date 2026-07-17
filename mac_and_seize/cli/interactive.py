@@ -24,6 +24,7 @@ appear in the right place with no changes here.
 
 from __future__ import annotations
 
+import logging
 import re
 import shlex
 import sys
@@ -43,10 +44,11 @@ except ImportError:  # pragma: no cover - readline is unavailable on some OSes
 from rich.console import Console
 from rich.table import Table
 
+from mac_and_seize.cli.tui import PromptAwareLogHandler
 from mac_and_seize.core.actions import Action
 from mac_and_seize.core.context import AppContext
 from mac_and_seize.core.errors import ModuleError
-from mac_and_seize.observability import get_logger
+from mac_and_seize.observability import LOGGER_NAME, get_logger
 from mac_and_seize.util.static import COLORS
 from mac_and_seize.util.system import is_root, relaunch_as_root
 
@@ -243,51 +245,100 @@ def run_interactive(context: AppContext) -> None:
     context_path: list[str] = []
     # The lambda reads the live `context_path`, so completions follow navigation.
     _install_completion(_Completer(tree, lambda: context_path))
+    # Let a presenter (e.g. background scan completion) redraw the live prompt
+    # when it prints out of band. The readline markers (\001/\002) are only for
+    # input()'s width math, so strip them for a direct terminal write.
+    if hasattr(context.presenter, "set_prompt_provider"):
+        context.presenter.set_prompt_provider(
+            lambda: _prompt(context_path).replace("\001", "").replace("\002", "")
+        )
+    # Route app log records around (not through) the live prompt for the
+    # duration of the session: a scan worker logging while the user sits at the
+    # prompt would otherwise corrupt the line (same failure mode as an
+    # out-of-band notify()).
+    _restore_log_handler = _install_prompt_log_handler(context)
     console.print(
         "\n[bold]Interactive session.[/] "
         "Type '[cyan]help[/]' to get started, '[cyan]quit[/]' to exit.\n"
     )
     logger.info("Interactive session started")
 
-    while True:
-        try:
-            line = input(_prompt(context_path)).strip()
-        except (EOFError, KeyboardInterrupt):
-            console.print()
-            break
+    try:
+        while True:
+            try:
+                line = input(_prompt(context_path)).strip()
+            except (EOFError, KeyboardInterrupt):
+                console.print()
+                break
 
-        if not line:
-            continue
-        try:
-            tokens = shlex.split(line)
-        except ValueError as exc:
-            console.print(f"[red]Parse error:[/] {exc}")
-            continue
-        if not tokens:
-            continue
-        head = tokens[0].lower()
-        if head in _QUIT_WORDS:
-            break
-        if head == "sudo":
-            _relaunch_sudo()
-            continue
-        if head == "tasks":
-            _show_tasks(context)
-            continue
-        if head in _BACK_WORDS:
-            context_path = _go_back(context_path)
-            continue
+            if not line:
+                continue
+            try:
+                tokens = shlex.split(line)
+            except ValueError as exc:
+                console.print(f"[red]Parse error:[/] {exc}")
+                continue
+            if not tokens:
+                continue
+            head = tokens[0].lower()
+            if head in _QUIT_WORDS:
+                break
+            if head == "sudo":
+                _relaunch_sudo()
+                continue
+            if head == "tasks":
+                _show_tasks(context)
+                continue
+            if head in _BACK_WORDS:
+                context_path = _go_back(context_path)
+                continue
 
-        try:
-            context_path = _dispatch(context, tree, context_path, tokens)
-        except UsageError as exc:
-            console.print(f"[red]{exc}[/]")
-        except Exception as exc:  # noqa: BLE001 - keep the session alive
-            console.print(f"[red]Unexpected error:[/] {exc}")
-            logger.exception("Unexpected error handling: %s", " ".join(tokens))
+            try:
+                context_path = _dispatch(context, tree, context_path, tokens)
+            except UsageError as exc:
+                console.print(f"[red]{exc}[/]")
+            except Exception as exc:  # noqa: BLE001 - keep the session alive
+                console.print(f"[red]Unexpected error:[/] {exc}")
+                logger.exception("Unexpected error handling: %s", " ".join(tokens))
+    finally:
+        _restore_log_handler()
 
     console.print("Goodbye.")
     logger.info("Interactive session ended")
+
+
+def _install_prompt_log_handler(context: AppContext) -> Callable[[], None]:
+    """Swap the app's console log handler for a prompt-aware one for the session.
+
+    Returns a zero-arg callable that restores the original handler. When the
+    session isn't an interactive TTY, or the presenter can't redraw the prompt,
+    this is a no-op (returns a callable that does nothing) so piped/headless
+    runs keep the plain stderr handler.
+    """
+    interactive = (
+        readline is not None
+        and sys.stdin.isatty()
+        and sys.stdout.isatty()
+        and hasattr(context.presenter, "emit_line")
+    )
+    app_logger = logging.getLogger(LOGGER_NAME)
+    original = next(
+        (h for h in app_logger.handlers if h.get_name() == "console"), None
+    )
+    if not interactive or original is None:
+        return lambda: None
+
+    handler = PromptAwareLogHandler(context.presenter)
+    handler.setLevel(original.level)
+    handler.setFormatter(original.formatter)
+    app_logger.removeHandler(original)
+    app_logger.addHandler(handler)
+
+    def restore() -> None:
+        app_logger.removeHandler(handler)
+        app_logger.addHandler(original)
+
+    return restore
 
 
 def _node_at(tree: CommandTree, path: list[str]) -> Node:

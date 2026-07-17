@@ -44,7 +44,7 @@ from `cli` or `server`.
 | `plugins.py` | `discover_modules()` and `ModuleSpec` — imports every subpackage of `modules/` and collects each one's `register()` output. |
 | `context.py` | `AppContext` — the application's shared state (config, timer, services, actions, presenter), built once at startup and threaded explicitly through the app. |
 | `errors.py` | `ModuleError`, the base exception type modules raise for expected operational failures. |
-| `presenter.py` | `Presenter` port + `Column` + `NullPresenter` — how a front-end supplies interactive views (e.g. a scrollable table) so modules render them without importing a front-end. |
+| `presenter.py` | `Presenter` port + `Column` + `NullPresenter` — how a front-end supplies interactive views (e.g. a scrollable table) and out-of-band status lines (`notify()`, for background work finishing) so modules render them without importing a front-end. |
 
 ### `modules/`
 
@@ -66,6 +66,15 @@ Self-contained, auto-discovered feature packages. See
 | `filters.py` | Structured include/exclude capture filters and the per-packet matching engine. |
 | `actions.py` | The `capture` command group (start/stop/export/import/clear/summary/inspect + `filter` subgroup). |
 
+**`discovery/`** — find live hosts on the network (service/port discovery is a
+stub for now).
+
+| File | Purpose |
+| --- | --- |
+| `service.py` | `DiscoveryService` — session store of discovered `Host`s keyed by IP, background ARP/ICMP sweep (pure scapy, no external `nmap`; one batch per method) of an address spec or a local interface's subnet, with an instant detach-cancel — a new scan can start at once while the abandoned probe drains (see `modules/README.md` §9). |
+| `host.py` | `Host` record and the named probe methods (`arp`/`ping`/`all`), whose selection is inspired by nmap's `-PR`/`-PE` options. |
+| `actions.py` | The `discovery` command group: `host` (scan/cancel/import/list/clear/summary) and a `service` stub. |
+
 ### `net/`
 
 Shared network domain layer (see [`net/README.md`](net/README.md) for the
@@ -80,7 +89,7 @@ model/adapters split and dependency rule).
 | `adapters/ip.py` | Link/address/route operations via `ip`, plus sysfs `read_state`/`is_up`. |
 | `adapters/ethtool.py` | `get_permanent_mac()` via a raw `SIOCETHTOOL` ioctl. |
 | `adapters/netifaces_io.py` | Interface enumeration and address records via `netifaces`. |
-| `adapters/scapy_io.py` | `send()`, `sniff()`, `write_pcap()`, `read_pcap()`, `available_interfaces()`. |
+| `adapters/scapy_io.py` | `send()`, `sniff()`, `write_pcap()`, `read_pcap()`, `available_interfaces()`, and host discovery (`expand_hosts()`, `arp_probe()`, `icmp_probe()`, `mac_vendor()`). |
 | `adapters/privileged.py` | `run()` (privileged-subprocess helper), `PrivilegedCommandError`, `family_flag()`. |
 
 ### `config/`

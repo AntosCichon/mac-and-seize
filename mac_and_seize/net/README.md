@@ -28,7 +28,7 @@ net/
     ip.py          link/addr/route ops via `ip`, + sysfs read_state/is_up
     ethtool.py     get_permanent_mac() via SIOCETHTOOL ioctl
     netifaces_io.py list_names(), read_addresses()
-    scapy_io.py    send(), sniff(), write_pcap(), read_pcap(), available_interfaces()
+    scapy_io.py    send(), sniff(), write/read_pcap(), available_interfaces(), expand_hosts(), arp/icmp_probe()
 ```
 
 ## Dependency rule

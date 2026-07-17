@@ -37,7 +37,6 @@ dependencies = [
     { name = "netifaces2" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
-    { name = "python-nmap" },
     { name = "scapy" },
     { name = "typer" },
 ]
@@ -47,7 +46,6 @@ requires-dist = [
     { name = "netifaces2", specifier = ">=0.0.22" },
     { name = "pydantic", specifier = ">=2.13.4" },
     { name = "pydantic-settings", specifier = ">=2.14.1" },
-    { name = "python-nmap", specifier = ">=0.7.1" },
     { name = "scapy", specifier = ">=2.7.0" },
     { name = "typer", specifier = ">=0.26.8" },
 ]
@@ -196,12 +194,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/82/ed/0301aeeac3e5353ef
 wheels = [
     { url = "https://files.pythonhosted.org/packages/0b/d7/1959b9648791274998a9c3526f6d0ec8fd2233e4d4acce81bbae76b44b2a/python_dotenv-1.2.2-py3-none-any.whl", hash = "sha256:1d8214789a24de455a8b8bd8ae6fe3c6b69a5e3d64aa8a8e5d68e694bbcb285a", size = 22101, upload-time = "2026-03-01T16:00:25.09Z" },
 ]
-
-[[package]]
-name = "python-nmap"
-version = "0.7.1"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/f7/1b/8e6b3d1461331e4e8600faf099e7c62ba3c1603987dafdd558681fb8ba37/python-nmap-0.7.1.tar.gz", hash = "sha256:f75af6b91dd8e3b0c31f869db32163f62ada686945e5b7c25f84bc0f7fad3b64", size = 44366, upload-time = "2021-10-26T18:40:26.488Z" }
 
 [[package]]
 name = "rich"

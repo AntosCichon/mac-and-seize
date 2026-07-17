@@ -16,6 +16,7 @@ from __future__ import annotations
 import atexit
 import logging
 import sys
+import warnings
 from pathlib import Path
 
 from mac_and_seize.config import AppConfig
@@ -44,6 +45,7 @@ def configure_logging(config: AppConfig) -> logging.Logger:
     logger.propagate = False
 
     console = logging.StreamHandler(stream=sys.stderr)
+    console.set_name("console")  # so the interactive front-end can find/replace it
     console.setFormatter(
         ColorFormatter(
             "%(asctime)s [%(levelname)s] %(message)s",
@@ -65,12 +67,38 @@ def configure_logging(config: AppConfig) -> logging.Logger:
     )
     logger.addHandler(file_handler)
 
+    _route_warnings_through(logger)
+
     atexit.register(_shutdown, config)
     _configured = True
     logger.debug(
         "Logging configured (level=%s, file=%s)", config.logging.level, log_path
     )
     return logger
+
+
+def _route_warnings_through(logger: logging.Logger) -> None:
+    """Send Python ``warnings.warn(...)`` output through the app logger.
+
+    Third-party libraries (scapy most of all) raise ``warnings.warn`` notices
+    that the ``warnings`` module prints straight to stderr, outside our
+    handlers. During an interactive session that lands raw on the prompt line
+    and corrupts it - the same failure mode as a stray ``print`` from a worker
+    thread (see ``modules/README.md`` §9). Routing them through a child of the
+    app logger makes them flow through whatever handler is installed (including
+    the prompt-aware handler the REPL swaps in, which lifts a background-thread
+    record *above* the prompt) and be formatted like our own records instead of
+    a bare library traceback line.
+
+    We only forward warnings the ``warnings`` filters would have shown anyway,
+    so this reroutes noise rather than amplifying it.
+    """
+    warnings_log = logger.getChild("warnings")
+
+    def _show(message, category, filename, lineno, file=None, line=None) -> None:
+        warnings_log.warning("%s: %s (%s:%s)", category.__name__, message, filename, lineno)
+
+    warnings.showwarning = _show
 
 
 def _shutdown(config: AppConfig) -> None:

@@ -327,11 +327,61 @@ def _stop(context, values):
   the work actually ends, e.g. inside your `stop()`).
 - `running() -> list[Task]` — what the `tasks` command lists.
 
-Because the REPL is single-threaded, **do not print from a worker thread** (it
-corrupts the prompt). Return data from the command that *reads* the results
-(`stop`, `summary`, ...) instead, and finalize self-stopped work lazily on the
-next command. All of this uses only `context.tasks` / `context.current_command`
-— no shared file is edited to add a background-capable module.
+Because the REPL is single-threaded, **never `print()` / write to stdout/stderr
+directly from a worker thread** — the main thread is sitting at the prompt, and
+a raw write lands on the prompt line and corrupts it. Return data from the
+command that *reads* the results (`stop`, `summary`, ...) instead, and finalize
+self-stopped work lazily on the next command. All of this uses only
+`context.tasks` / `context.current_command` — no shared file is edited to add a
+background-capable module.
+
+Two front-end-mediated outputs *are* safe from a worker thread, because the CLI
+prints them *above* the prompt and repaints it:
+
+- **`context.presenter.notify(message)`** — a fire-and-forget status line for
+  work that finishes while the user is elsewhere in the session (see
+  `core/presenter.py`). It goes through the front-end, so a headless embedding
+  can log it instead of writing to a terminal that isn't there, and it is held
+  back (not dropped) while a full-screen view like `inspect` owns the screen,
+  then flushed when that view closes. Use it sparingly — it deliberately
+  interrupts whatever the user is doing — and only for events the user has no
+  other way to learn about promptly.
+- **`get_logger(__name__)`** — logging from a worker thread is fine; during the
+  interactive session the front-end swaps in a prompt-aware log handler that
+  routes background-thread records above the prompt (see
+  `cli.tui.PromptAwareLogHandler`). This is *logging*, not user output: use
+  `notify()` for things the user must see, `get_logger()` for the record trail.
+
+If you drive a noisy third-party library on a worker thread (scapy prints
+per-packet warnings straight to stderr through its own logger), quiet it at the
+adapter boundary rather than letting it reach the terminal — see
+`net/adapters/scapy_io.py`, which raises `scapy.runtime` to `ERROR`.
+
+### Best-effort cancel for non-cooperative work
+
+`stop`/`cancel` cannot always be a clean, synchronous handoff. `capture`'s
+`AsyncSniffer` supports it because scapy owns the socket read loop and can be
+told to stop between packets. Other calls offer no such hook: a blocking
+scapy `sr()`/`srp()` sweep (as `discovery` uses) runs until its timeout with
+no cooperative interrupt, and a blocking subprocess can only be stopped by
+killing the process. When that's the case, prefer a **soft cancel**:
+immediately call `context.tasks.finish(task)` so `tasks` reflects reality (the
+work is no longer something the user should wait on), record that the run was
+cancelled, and have the worker thread discard its own results instead of
+storing them once the underlying call eventually returns.
+
+Give each run its own **identity** (a small per-run object) rather than storing
+`self._thread` / `self._cancelled` directly on the service. Cancelling then
+*detaches* the current run — clear it as the service's active run and flip its
+`cancelled` flag — so the next command can start a fresh run **immediately**,
+without waiting for the abandoned one to drain. The orphaned worker keeps
+running to its timeout, then, seeing its own `cancelled`, throws its results
+away and touches no shared state it no longer owns (it checks `is this still the
+current run?` before committing). `discovery` does exactly this. Say so
+explicitly in the action's `description` — "cancelling is instant; the
+abandoned probe finishes on its own in the background and its results are
+discarded" is a real behavioral difference a user needs to know, not an
+implementation detail to hide.
 
 ---
 
