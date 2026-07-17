@@ -2,7 +2,7 @@
 
 Auto-discovered via :func:`register`. Registers one session-scoped service
 (``"discovery"``) and the ``discovery`` command group: ``host``
-(scan/cancel/import/list/clear/summary - scapy ARP/ICMP sweeps, plus identifying
+(scan/cancel/import/list/clear/summary - scapy ARP sweeps, plus identifying
 active hosts from an imported pcap) and a ``service`` stub for future
 port/service discovery.
 """

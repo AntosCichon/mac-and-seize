@@ -71,8 +71,8 @@ stub for now).
 
 | File | Purpose |
 | --- | --- |
-| `service.py` | `DiscoveryService` — session store of discovered `Host`s keyed by IP, background ARP/ICMP sweep (pure scapy, no external `nmap`; one batch per method) of an address spec or a local interface's subnet, with an instant detach-cancel — a new scan can start at once while the abandoned probe drains (see `modules/README.md` §9). |
-| `host.py` | `Host` record and the named probe methods (`arp`/`ping`/`all`), whose selection is inspired by nmap's `-PR`/`-PE` options. |
+| `service.py` | `DiscoveryService` — session store of discovered `Host`s keyed by IP, background ARP sweep (pure scapy, no external `nmap`; one batch, local link only) of an address spec or a local interface's subnet, with an instant detach-cancel — a new scan can start at once while the abandoned probe drains (see `modules/README.md` §9). |
+| `host.py` | `Host` record; hosts are found by the ARP sweep (inspired by nmap's `-PR`) or imported from a pcap, tracked in `Host.method` (`arp`/`pcap`). |
 | `actions.py` | The `discovery` command group: `host` (scan/cancel/import/list/clear/summary) and a `service` stub. |
 
 ### `net/`

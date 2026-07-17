@@ -3,24 +3,22 @@
 Like ``CaptureService``, this is instantiated once per
 :class:`~mac_and_seize.core.context.AppContext` and holds session state: hosts
 found so far, keyed by IP so repeat scans refresh an already-known host
-instead of duplicating it. A scan runs ARP and/or ICMP probes (via the shared
-scapy adapter - no external ``nmap`` binary) in a background thread so the
-prompt stays responsive; only one scan may run at a time.
+instead of duplicating it. A scan ARP-probes the target (via the shared scapy
+adapter - no external ``nmap`` binary) in a background thread so the prompt
+stays responsive; only one scan may run at a time.
 
 A scan target is either an **address spec** (IP, CIDR, last-octet range, or
 hostname) scanned via the default route, or the name of a **local interface**,
 in which case the subnet that NIC is on is scanned and the probes are pinned to
 that interface (so multi-homed hosts can scan the right link). See
-:meth:`_resolve_target`.
+:meth:`_resolve_target`. ARP is not routed, so a scan only finds hosts on the
+local link; the whole target is swept in one batch.
 
-The scan probes are a pure-scapy implementation whose *method selection* is
-inspired by nmap's host-discovery options (ARP ``-PR`` / ICMP-echo ``-PE``);
-none of nmap's code is used. The whole target is swept in one batch per method:
-for ``--method all`` the ARP sweep runs first and the ICMP sweep then probes
-only the hosts ARP did not already find up (so no host is probed twice).
+The probe is a pure-scapy ARP sweep inspired by nmap's ``-PR`` host discovery;
+none of nmap's code is used.
 
-scapy's ``sr``/``srp`` block until their timeout with no cooperative interrupt
-point, so a running probe cannot be stopped mid-flight. ``cancel_scan`` is
+scapy's ``srp`` blocks until its timeout with no cooperative interrupt point, so
+a running probe cannot be stopped mid-flight. ``cancel_scan`` is
 therefore *instant by detachment* (see ``modules/README.md`` §9): each scan is a
 :class:`_Run` with its own identity, and cancelling drops its task from
 ``tasks``, clears it as the current run, and marks it cancelled - so a new scan
@@ -42,10 +40,10 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 from mac_and_seize.core.errors import ModuleError
-from mac_and_seize.modules.discovery.host import METHODS, Host
+from mac_and_seize.modules.discovery.host import Host
 from mac_and_seize.net.adapters import netifaces_io, scapy_io
 from mac_and_seize.observability import get_logger
 
@@ -53,22 +51,13 @@ if TYPE_CHECKING:
     from mac_and_seize.core.context import AppContext
     from mac_and_seize.core.tasks import Task
 
-#: Default seconds to wait for probe replies when the user gives no --timeout.
-_DEFAULT_TIMEOUT = 3
-
-#: Each probe method mapped to a callable ``(hosts, timeout, iface) ->
-#: {ip: mac|None}`` over the shared scapy adapter. Only the layer-2 ARP sweep
-#: can be pinned to a NIC (``iface``); the layer-3 ICMP sweep is kernel-routed
-#: and ignores it (see :func:`scapy_io.icmp_probe`). ARP yields a MAC; ICMP echo
-#: (``ping``) yields the IP only.
-_PROBES: dict[str, Callable[[list[str], int, str | None], dict[str, str | None]]] = {
-    "arp": lambda hosts, timeout, iface: dict(
-        scapy_io.arp_probe(hosts, timeout=timeout, iface=iface)
-    ),
-    "ping": lambda hosts, timeout, _iface: {
-        ip: None for ip in scapy_io.icmp_probe(hosts, timeout=timeout)
-    },
-}
+#: Default seconds to wait for ARP replies when the user gives no --timeout.
+#: A reply on the local link returns in well under a millisecond, so a short
+#: wait suffices - and it matters: scapy's sweep only ends early once *every*
+#: probe is answered, which never happens when the target range covers unused
+#: addresses, so it always blocks for the full timeout. Keeping this small is
+#: what keeps a subnet sweep fast.
+_DEFAULT_TIMEOUT = 0.5
 
 #: Source addresses that identify no real host (never treated as active).
 _NON_HOST_SOURCES = {"0.0.0.0", "::"}
@@ -152,24 +141,18 @@ class DiscoveryService:
         context: "AppContext",
         target: str,
         *,
-        method: str = "all",
         timeout: int | None = None,
     ) -> str:
-        """Start a background host-discovery scan against ``target``."""
+        """Start a background ARP host-discovery scan against ``target``."""
         target = target.strip()
         if not target:
             raise ValueError("A scan target is required (e.g. an IP, CIDR, or range).")
-        if method not in METHODS:
-            raise ValueError(
-                f"Unknown method {method!r}. Supported: {', '.join(METHODS)}."
-            )
         if timeout is not None and timeout <= 0:
             raise ValueError("--timeout must be a positive number of seconds.")
         wait = timeout or _DEFAULT_TIMEOUT
         # Resolve up front (synchronously) so a bad interface / bad or oversized
         # address target fails now, before a background task is registered.
         iface, hosts = self._resolve_target(target)
-        methods = METHODS[method]
 
         with self._lock:
             if self.is_scanning():
@@ -184,14 +167,14 @@ class DiscoveryService:
             )
             run.thread = threading.Thread(
                 target=self._run_scan,
-                args=(run, hosts, methods, wait),
+                args=(run, hosts, wait),
                 daemon=True,
             )
             self._run = run
             run.thread.start()
         self._log.info(
-            "Discovery scan started (target=%s, iface=%s, method=%s, hosts=%d)",
-            target, iface or "default", method, len(hosts),
+            "Discovery scan started (target=%s, iface=%s, hosts=%d)",
+            target, iface or "default", len(hosts),
         )
         return (
             f"Scan started in the background for {target} "
@@ -248,27 +231,22 @@ class DiscoveryService:
         self,
         run: _Run,
         hosts: list[str],
-        methods: tuple[str, ...],
-        timeout: int,
+        timeout: float,
     ) -> None:
         target = run.target
-        # ip -> (mac|None, method that found it). ARP runs before ping, so a
-        # host found on-link keeps its MAC and isn't re-probed by ping.
+        # ip -> (mac, method that found it); the ARP sweep always reports "arp".
         replies: dict[str, tuple[str | None, str]] = {}
         error: Exception | None = None
         try:
-            # One sweep per method over the hosts not yet found up. Checking
-            # cancellation between methods lets a cancel during the ARP sweep
-            # skip the ICMP sweep (the in-flight probe still runs to timeout).
-            remaining = set(hosts)
-            for method in methods:
-                if not remaining or run.cancelled:
-                    break
-                found = _PROBES[method](sorted(remaining), timeout, run.iface)
+            # A single ARP sweep over the whole target. The guard lets a cancel
+            # that lands before the probe starts skip it entirely; once srp is
+            # in flight it runs to its timeout (there is no cooperative stop).
+            if not run.cancelled:
+                found = scapy_io.arp_probe(
+                    sorted(set(hosts)), timeout=timeout, iface=run.iface
+                )
                 for ip, mac in found.items():
-                    if ip in remaining:
-                        replies[ip] = (mac, method)
-                        remaining.discard(ip)
+                    replies[ip] = (mac, "arp")
         except PermissionError as exc:
             error = ModuleError(
                 "Host discovery needs raw-socket access; relaunch as root (sudo)."

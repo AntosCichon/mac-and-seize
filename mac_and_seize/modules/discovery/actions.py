@@ -10,7 +10,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from mac_and_seize.core.actions import Action, Param
-from mac_and_seize.modules.discovery.host import METHODS
 
 if TYPE_CHECKING:
     from mac_and_seize.core.context import AppContext
@@ -20,7 +19,7 @@ SERVICE = "discovery"
 
 GROUP_DESCRIPTIONS = {
     "discovery": "Discover hosts (and, in future, services) on the network",
-    "discovery.host": "Find live hosts with ARP/ICMP sweeps",
+    "discovery.host": "Find live hosts with ARP sweeps",
     "discovery.service": "Discover services on a host (not implemented yet)",
 }
 
@@ -33,7 +32,6 @@ def _scan(context: "AppContext", values: dict) -> str:
     return _service(context).start_scan(
         context,
         values["target"],
-        method=values.get("method") or "all",
         timeout=values.get("timeout"),
     )
 
@@ -72,17 +70,18 @@ def build_actions() -> list[Action]:
         Action(
             "discovery.host.scan",
             "Scan for hosts",
-            "Start a background host-discovery sweep (ARP and/or ICMP echo, in "
-            "pure scapy - no external nmap binary) against a target: a single "
-            "IP, CIDR (192.168.1.0/24), last-octet range (192.168.1.10-20), "
-            "hostname, or the name of a local interface (e.g. eth0) to scan the "
-            "subnet that NIC is on. For a CIDR the network and broadcast "
-            "addresses are skipped. The prompt stays usable while it runs and a "
-            "line announces completion regardless of your current context; "
-            "results appear in 'discovery host list'. Cancelling is instant - "
-            "you can start another scan right away - and discards the cancelled "
-            "scan's results while its probe drains in the background. Method "
-            "names mirror nmap's -PR/-PE options (requires root).",
+            "Start a background host-discovery sweep (a pure-scapy ARP sweep - no "
+            "external nmap binary) against a target: a single IP, CIDR "
+            "(192.168.1.0/24), last-octet range (192.168.1.10-20), hostname, or "
+            "the name of a local interface (e.g. eth0) to scan the subnet that "
+            "NIC is on. For a CIDR the network and broadcast addresses are "
+            "skipped. ARP is not routed, so only hosts on the local link are "
+            "found. The prompt stays usable while it runs and a line announces "
+            "completion regardless of your current context; results appear in "
+            "'discovery host list'. Cancelling is instant - you can start "
+            "another scan right away - and discards the cancelled scan's results "
+            "while its probe drains in the background. The sweep mirrors nmap's "
+            "-PR host discovery (requires root).",
             _scan,
             [
                 Param(
@@ -91,24 +90,16 @@ def build_actions() -> list[Action]:
                     "local interface name (scans that NIC's subnet)",
                 ),
                 Param(
-                    "method",
-                    f"Probe method: {', '.join(METHODS)} (arp=local subnet, "
-                    "ping=ICMP echo, all=try each and stop at the first that "
-                    "finds a host up)",
-                    required=False,
-                    default="all",
-                ),
-                Param(
                     "timeout",
-                    "Seconds to wait for replies per sweep (default: 3)",
+                    "Seconds to wait for ARP replies (default: 0.5)",
                     int,
                     required=False,
                 ),
             ],
             [
                 "discovery host scan 192.168.1.0/24",
-                "discovery host scan 192.168.1.10-20 --method arp",
-                "discovery host scan 192.168.1.1 --method ping --timeout 5",
+                "discovery host scan 192.168.1.10-20",
+                "discovery host scan 192.168.1.1 --timeout 2",
                 "discovery host scan eth0",
             ],
             requires_root=True,

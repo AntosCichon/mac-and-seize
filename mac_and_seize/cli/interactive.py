@@ -58,8 +58,11 @@ logger = get_logger("mac_and_seize.cli.interactive")
 _HELP_WORDS = {"help", "h", "?"}
 _QUIT_WORDS = {"quit", "exit", "q"}
 _BACK_WORDS = {"back", ".."}
+# ``home`` jumps straight to the root context; ``/`` mirrors the ``/``-separated
+# path shown in the prompt (mac-and-seize/interface -> root).
+_HOME_WORDS = {"home", "/"}
 # Built-ins offered as first-word completions (canonical spellings only).
-_BUILTIN_WORDS = ["help", "back", "sudo", "tasks", "quit"]
+_BUILTIN_WORDS = ["help", "back", "home", "sudo", "tasks", "quit"]
 
 
 def _location(context_path: list[str]) -> str:
@@ -193,7 +196,12 @@ class _Completer:
             if len(prior) == 1:
                 return sorted(n for n in local | top if n.startswith(text))
             return self._descend(context_path, prior[1], prior[1:], text)
-        if first in _BACK_WORDS or first in _QUIT_WORDS or first in ("sudo", "tasks"):
+        if (
+            first in _BACK_WORDS
+            or first in _HOME_WORDS
+            or first in _QUIT_WORDS
+            or first in ("sudo", "tasks")
+        ):
             return []
 
         return self._descend(context_path, first, prior, text)
@@ -292,6 +300,9 @@ def run_interactive(context: AppContext) -> None:
             if head in _BACK_WORDS:
                 context_path = _go_back(context_path)
                 continue
+            if head in _HOME_WORDS:
+                context_path = _go_home(context_path)
+                continue
 
             try:
                 context_path = _dispatch(context, tree, context_path, tokens)
@@ -374,6 +385,13 @@ def _go_back(context_path: list[str]) -> list[str]:
         console.print("[yellow]Already at the top level.[/]")
         return context_path
     return context_path[:-1]
+
+
+def _go_home(context_path: list[str]) -> list[str]:
+    """Jump straight to the root context from any depth (``back`` to the top)."""
+    if not context_path:
+        console.print("[yellow]Already at the top level.[/]")
+    return []
 
 
 def _show_tasks(context: AppContext) -> None:
@@ -688,6 +706,7 @@ def _root_help(descriptions: dict[str, str], root: Node) -> None:
     console.print("\n[bold]Built-in[/]")
     console.print(f"  [cyan]{'help, ?':<10}[/] Show help; 'help <command>' for details")
     console.print(f"  [cyan]{'back':<10}[/] Leave the current group (one level up)")
+    console.print(f"  [cyan]{'home':<10}[/] Jump back to the top level from anywhere")
     console.print(f"  [cyan]{'sudo':<10}[/] Relaunch the app with root privileges")
     console.print(f"  [cyan]{'tasks':<10}[/] List running background tasks")
     console.print(f"  [cyan]{'quit':<10}[/] Leave the session (also: exit, Ctrl-D)")

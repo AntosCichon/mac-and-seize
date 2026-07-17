@@ -1,5 +1,5 @@
 """Packet I/O over scapy: send, one-shot sniff, pcap read/write, NIC listing,
-and host discovery (ARP/ICMP sweeps).
+and host discovery (ARP sweeps).
 
 The generic (non-session) packet I/O that any module can reuse. Background
 capture lifecycle (scapy's ``AsyncSniffer``) stays with the capture module,
@@ -12,19 +12,17 @@ import ipaddress
 import logging
 import re
 
-from scapy.all import ARP, ICMP, IP, Ether, conf, get_if_list, sniff as _sniff, sr, srp
+from scapy.all import ARP, Ether, conf, get_if_list, sniff as _sniff, srp
 from scapy.utils import rdpcap, wrpcap
 
 from mac_and_seize.net.model.packet import Packet
 
 # scapy logs benign, per-packet notices through its own ``scapy.runtime`` logger
-# straight to stderr - most notably, for every unanswered address in a sweep,
-# "MAC address to reach destination not found. Using broadcast." (a routed probe
-# whose next-hop MAC didn't ARP-resolve). During a subnet scan that is one line
-# per down host, printed from a worker thread right onto the interactive prompt.
-# These are noise for this tool, so raise the level to drop scapy's WARNINGs
-# from the console; genuine scapy ERRORs still surface and our own file logging
-# is unaffected. See modules/README.md §9 on not disturbing the prompt.
+# straight to stderr, from whichever worker thread is sending - which during an
+# interactive session would print right onto the live prompt. These are noise
+# for this tool, so raise the level to drop scapy's WARNINGs from the console;
+# genuine scapy ERRORs still surface and our own file logging is unaffected.
+# See modules/README.md §9 on not disturbing the prompt.
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 
 # A last-octet range such as ``192.168.1.10-20``. scapy's ``Net`` accepts a
@@ -90,7 +88,7 @@ def expand_hosts(target: str) -> list[str]:
 
 
 def arp_probe(
-    hosts: list[str], *, timeout: int = 3, iface: str | None = None
+    hosts: list[str], *, timeout: float = 0.5, iface: str | None = None
 ) -> dict[str, str]:
     """ARP-probe ``hosts`` (an explicit address list); return ``{ip: mac}``.
 
@@ -98,9 +96,11 @@ def arp_probe(
     Only works on the local subnet (ARP is not routed). ``iface`` pins the
     probe to a specific NIC (needed on a multi-homed host so the requests leave
     the interface that is actually on the target subnet); ``None`` lets scapy
-    pick its default. The probe design mirrors nmap's ARP host discovery
-    (``-PR``); the implementation here is an original scapy composition, not
-    derived from nmap's source.
+    pick its default. A ``filter="arp"`` BPF is installed on the receive socket
+    so the sniffer only pulls ARP frames off the link (and Python-matches only
+    those), instead of every frame on a busy segment. The probe design mirrors
+    nmap's ARP host discovery (``-PR``); the implementation here is an original
+    scapy composition, not derived from nmap's source.
     """
     if not hosts:
         return {}
@@ -108,44 +108,13 @@ def arp_probe(
         Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=hosts),
         timeout=timeout,
         iface=iface,
+        filter="arp",
         verbose=False,
     )
     found: dict[str, str] = {}
     for _sent, received in answered:
         found.setdefault(received.psrc, received.hwsrc)
     return found
-
-
-def icmp_probe(hosts: list[str], *, timeout: int = 3) -> set[str]:
-    """ICMP-echo-probe ``hosts`` (an explicit address list); return replying IPs.
-
-    Sends an ICMP echo request (type 8) to each address at layer 3, so it
-    reaches routed hosts too. Being layer 3, it is routed by the kernel's
-    routing table and has no interface to pin it to - scapy's L3 ``sr`` ignores
-    ``iface`` (and warns if given one). That is fine for discovery: probes for a
-    subnet already leave whichever NIC owns that subnet, so scanning an
-    interface only needs the ARP sweep pinned (see :func:`arp_probe`). The probe
-    design mirrors nmap's ICMP echo host discovery (``-PE``); the scapy
-    implementation here is original.
-
-    scapy's ``sr`` treats an ICMP *error* (destination-unreachable, TTL
-    exceeded) that quotes our echo request as an "answer", but its source is a
-    router or firewall on the path - not a live target - so counting it would
-    report a false host. We keep only genuine echo *replies* (ICMP type 0)
-    whose source is the exact address we probed, which drops those errors.
-    """
-    if not hosts:
-        return set()
-    answered, _ = sr(IP(dst=hosts) / ICMP(type=8), timeout=timeout, verbose=False)
-    replied: set[str] = set()
-    for sent, received in answered:
-        icmp = received.getlayer(ICMP)
-        if icmp is None or int(icmp.type) != 0:
-            continue  # error reply (type 3/11, ...) from a router, not the host
-        if received[IP].src != sent[IP].dst:
-            continue  # reply source isn't the address we probed
-        replied.add(received[IP].src)
-    return replied
 
 
 def mac_vendor(mac: str | None) -> str | None:
