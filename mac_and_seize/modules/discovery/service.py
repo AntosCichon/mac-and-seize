@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from mac_and_seize.core.errors import ModuleError
-from mac_and_seize.modules.discovery.host import Host
+from mac_and_seize.modules.discovery.host import Host, aggregate_rows
 from mac_and_seize.net.adapters import netifaces_io, scapy_io
 from mac_and_seize.observability import get_logger
 
@@ -346,7 +346,7 @@ class DiscoveryService:
 
     def list_hosts(self) -> list[dict]:
         with self._lock:
-            return [host.as_row() for host in self._hosts.values()]
+            return aggregate_rows(self._hosts.values())
 
     def summary(self) -> dict:
         with self._lock:
@@ -355,8 +355,17 @@ class DiscoveryService:
         methods: dict[str, int] = {}
         for host in hosts:
             methods[host.method] = methods.get(host.method, 0) + 1
+        # Logical = unique IP addresses (one per stored host); physical = unique
+        # MAC addresses. A host with several IPs on one NIC is many logical
+        # addresses but a single physical one, so the headline reports both and
+        # sums them (this is also why 'list' can show fewer rows than logical).
+        logical = len(hosts)
+        physical = len({host.mac for host in hosts if host.mac})
         return {
-            "hosts": len(hosts),
+            "found": (
+                f"{logical + physical} unique addresses "
+                f"({logical} logical, {physical} physical)"
+            ),
             "with_mac": sum(1 for host in hosts if host.mac),
             "with_vendor": sum(1 for host in hosts if host.vendor),
             "by_method": ", ".join(f"{k}={v}" for k, v in sorted(methods.items())),
