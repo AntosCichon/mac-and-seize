@@ -54,6 +54,25 @@ def ieee_channels() -> list[int]:
     return list(IEEE_CHANNELS)
 
 
+def supported_channels(name: str) -> list[int]:
+    """The IEEE channels this card can actually tune, in IEEE order.
+
+    Read from the driver via nl80211 so a sweep can skip channels the radio
+    cannot honour - most importantly the 5 GHz band on a 2.4 GHz-only adapter -
+    instead of wasting the hop cycle failing to set them (which also parks the
+    card on the last good channel and starves the others). Falls back to every
+    IEEE channel if the driver does not report its channel set.
+    """
+    card = _card(name)
+    try:
+        channels = pyw.devchs(card)
+    except pyric.error as exc:
+        _log.debug("Could not read supported channels of %s: %s", name, exc)
+        return list(IEEE_CHANNELS)
+    allowed = set(IEEE_CHANNELS) & {int(c) for c in channels}
+    return [c for c in IEEE_CHANNELS if c in allowed] or list(IEEE_CHANNELS)
+
+
 def validate_channels(channels: list[int]) -> tuple[list[int], list[int]]:
     """Split ``channels`` into ``(valid, rejected)`` against :data:`IEEE_CHANNELS`.
 
@@ -180,4 +199,6 @@ def set_channel(name: str, channel: int) -> None:
             f"Could not set {name!r} to channel {channel}: {exc} "
             "(the card may not support this channel)."
         ) from exc
-    _log.info("Set %s to channel %d", name, channel)
+    # Debug, not info: a channel sweep calls this several times a second, and at
+    # info it would flood the interactive prompt (see modules/README.md 9).
+    _log.debug("Set %s to channel %d", name, channel)

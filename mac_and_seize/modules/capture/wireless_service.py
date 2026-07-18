@@ -86,14 +86,28 @@ class WirelessCaptureService(PacketSession):
 
         hop_channels: list[int] | None = None
         rejected: list[int] = []
+        unsupported: list[int] = []
         if sweep:
             valid, rejected = wireless.validate_channels(self._parse_channels(sweep))
             if not valid:
                 raise ValueError("No valid IEEE 802.11 channels to sweep.")
-            if len(valid) == 1:
-                wireless.set_channel(interface, valid[0])
+            # Keep only channels the radio can actually tune. A 2.4 GHz-only card
+            # asked to sweep 'all' would otherwise spend most of the cycle failing
+            # to set 5 GHz channels - parked on one channel, so only that channel's
+            # networks are seen.
+            supported = set(wireless.supported_channels(interface))
+            tunable = [c for c in valid if c in supported]
+            unsupported = [c for c in valid if c not in supported]
+            if not tunable:
+                raise ModuleError(
+                    f"{interface} cannot tune any of the requested channel(s) "
+                    f"{valid}. It may be a 2.4 GHz-only radio, or these are "
+                    "5 GHz/DFS channels the driver does not support."
+                )
+            if len(tunable) == 1:
+                wireless.set_channel(interface, tunable[0])
             else:
-                hop_channels = valid
+                hop_channels = tunable
 
         with self._lock:
             predicate = build_wireless_predicate(self.filters)
@@ -107,11 +121,13 @@ class WirelessCaptureService(PacketSession):
             self._start_hopper(interface, hop_channels, hop_interval)
 
         return self._compose_start_message(
-            interface, outcome, time, count, hop_channels, hop_interval, rejected
+            interface, outcome, time, count, hop_channels, hop_interval,
+            rejected, unsupported,
         )
 
     def _compose_start_message(
-        self, interface, outcome, time, count, hop_channels, hop_interval, rejected
+        self, interface, outcome, time, count, hop_channels, hop_interval,
+        rejected, unsupported,
     ) -> str:
         kind, n = outcome
         try:
@@ -130,9 +146,14 @@ class WirelessCaptureService(PacketSession):
 
         reject_note = ""
         if rejected:
-            reject_note = (
+            reject_note += (
                 f" channels {rejected} are not IEEE 802.11 defined Wi-Fi channels, "
                 "they've been excluded from sweep."
+            )
+        if unsupported:
+            reject_note += (
+                f" channels {unsupported} are not tunable by {interface} "
+                "(likely a different band the radio does not support); skipped."
             )
 
         if kind == "immediate":
@@ -169,7 +190,9 @@ class WirelessCaptureService(PacketSession):
                 try:
                     wireless.set_channel(interface, channel)
                 except Exception as exc:  # noqa: BLE001 - a bad channel must not kill the sweep
-                    self._log.warning(
+                    # Debug, not warning: a DFS channel can refuse repeatedly and
+                    # this runs every hop - it must not flood the prompt.
+                    self._log.debug(
                         "Sweep: could not tune %s to channel %d: %s",
                         interface, channel, exc,
                     )
@@ -222,6 +245,10 @@ class WirelessCaptureService(PacketSession):
             self._log.info(
                 "activity: excluding non-IEEE channels %s", rejected
             )
+        # Scan only channels the card can tune, so a 2.4 GHz-only radio doesn't
+        # waste the scan dwelling on 5 GHz channels it cannot set.
+        supported = set(wireless.supported_channels(interface))
+        valid = [c for c in valid if c in supported]
         if not valid:
             raise ValueError("No valid IEEE 802.11 channels to scan.")
 
