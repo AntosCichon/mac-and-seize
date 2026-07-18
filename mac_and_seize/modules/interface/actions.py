@@ -67,6 +67,16 @@ def _interface_down(context: "AppContext", values: dict) -> str:
     return f"{values['name']} is now {state}"
 
 
+def _set_mode(context: "AppContext", values: dict) -> str:
+    mode = _service(context).set_mode(values["name"], values["mode"])
+    return f"{values['name']} is now in {mode} mode"
+
+
+def _set_channel(context: "AppContext", values: dict) -> str:
+    channel = _service(context).set_channel(values["name"], values["channel"])
+    return f"{values['name']} tuned to channel {channel}"
+
+
 def _set_mac(context: "AppContext", values: dict) -> str:
     result = _service(context).set_mac(
         values["name"], values["mac"], preserve_routes=not values["no-preserve"]
@@ -250,6 +260,37 @@ def build_actions() -> list[Action]:
                 "interface mac eth0 default",
                 "interface mac eth0 02:11:22:33:44:55 --no-preserve",
             ],
+            requires_root=True,
+        ),
+        Action(
+            "interface.mode",
+            "Set wireless mode",
+            "Switch a wireless interface between 'monitor' and 'managed' mode "
+            "(requires root). Only valid on 802.11 interfaces; the change briefly "
+            "cycles the link. Note: a running network manager "
+            "(NetworkManager/wpa_supplicant) may revert monitor mode - stop or "
+            "unmanage the interface first if that happens.",
+            _set_mode,
+            [
+                Param("name", "Wireless interface (e.g. wlan0)"),
+                Param("mode", "Target mode: 'monitor' or 'managed'"),
+            ],
+            ["interface mode wlan0 monitor", "interface mode wlan0 managed"],
+            requires_root=True,
+        ),
+        Action(
+            "interface.channel",
+            "Set wireless channel",
+            "Tune a monitor-mode wireless interface to an IEEE 802.11 channel "
+            "(requires root). The interface must already be in monitor mode "
+            "(see 'interface mode'). Only 2.4 GHz (1-14) and 5 GHz channels are "
+            "accepted.",
+            _set_channel,
+            [
+                Param("name", "Wireless interface (e.g. wlan0)"),
+                Param("channel", "IEEE 802.11 channel number (e.g. 6, 36)", int),
+            ],
+            ["interface channel wlan0 6", "interface channel wlan0 36"],
             requires_root=True,
         ),
     ]

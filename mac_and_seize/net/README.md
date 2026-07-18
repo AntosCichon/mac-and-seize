@@ -29,6 +29,7 @@ net/
     ethtool.py     get_permanent_mac() via SIOCETHTOOL ioctl
     netifaces_io.py list_names(), read_addresses()
     scapy_io.py    send(), sniff(), write/read_pcap(), available_interfaces(), expand_hosts(), arp/icmp_probe()
+    wireless.py    is_wireless(), set_mode(), set_channel(), current_mode/channel(), ieee/validate_channels()  (nl80211 via PyRIC)
 ```
 
 ## Dependency rule

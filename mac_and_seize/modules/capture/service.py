@@ -6,15 +6,16 @@ Unlike a stateless helper, this service is instantiated once per
 the running background sniffer (if any). Captures run in the background via
 scapy's :class:`AsyncSniffer` so the interactive prompt stays responsive; the
 captured packets are appended to the session on stop.
+
+The background-capture lifecycle (starting/reaping/stopping the sniffer and the
+packet store) lives in the shared :class:`~mac_and_seize.modules.capture.session.PacketSession`
+base, so this class only adds the **wired** concerns: the include/exclude filter
+set, socket-level interface selection, and the summary/inspect views.
 """
 
 from __future__ import annotations
 
-import threading
-from pathlib import Path
 from typing import TYPE_CHECKING
-
-from scapy.all import AsyncSniffer
 
 from mac_and_seize.core.errors import ModuleError
 from mac_and_seize.modules.capture.filters import (
@@ -26,20 +27,14 @@ from mac_and_seize.modules.capture.filters import (
     select_interfaces,
     split_values,
 )
-from mac_and_seize.net import Packet
+from mac_and_seize.modules.capture.session import PacketSession
 from mac_and_seize.net.adapters import scapy_io
-from mac_and_seize.observability import get_logger
 
 if TYPE_CHECKING:
     from mac_and_seize.core.context import AppContext
-    from mac_and_seize.core.tasks import Task
-
-#: Relative export/target paths are resolved under this directory (created on
-#: demand) instead of the current working directory.
-DEFAULT_EXPORT_DIR = Path("exports")
 
 
-class CaptureService:
+class CaptureService(PacketSession):
     """Background packet capture with a per-session store of packets and filters.
 
     Sniffing requires root; callers (the CLI) gate root-only actions before
@@ -48,40 +43,17 @@ class CaptureService:
     """
 
     def __init__(self) -> None:
-        self._log = get_logger(__name__)
-        self._lock = threading.RLock()
-        self.packets: list[Packet] = []
+        super().__init__()
         self.filters: list[Filter] = []
         self._next_id = 1
-        self._sniffer: AsyncSniffer | None = None
-        self._task: "Task | None" = None
-        self._context: "AppContext | None" = None
-        self._error: BaseException | None = None
-        self._capture_ifaces: list[str] = []
 
     # --- Background capture ---------------------------------------------------
-
-    def is_capturing(self) -> bool:
-        with self._lock:
-            self._reap_locked()
-            return self._sniffer is not None
 
     def start(
         self, context: "AppContext", *, time: int | None = None, count: int | None = None
     ) -> str:
         """Start a background capture using the current filter set."""
         with self._lock:
-            self._reap_locked()
-            if self._sniffer is not None:
-                raise ModuleError(
-                    "A capture is already running. Stop it before starting another."
-                )
-            if time is not None and time <= 0:
-                raise ValueError("--time must be a positive number of seconds.")
-            if count is not None and count < 0:
-                raise ValueError("--count cannot be negative.")
-
-            self._error = None
             predicate = build_predicate(self.filters)
             # Interface filters are applied here, at the socket level: scapy only
             # tags a packet with its interface *after* lfilter runs, so the NIC
@@ -97,150 +69,15 @@ class CaptureService:
                     "Interface filters exclude every available interface; "
                     "nothing to capture on."
                 )
-            interfaces = selected or None
-            self._capture_ifaces = list(selected)
-            sniffer = AsyncSniffer(
-                iface=interfaces,
-                lfilter=predicate,
-                store=True,
-                timeout=time or None,
-                count=count or 0,
-            )
-            sniffer.start()
-
-            # A capture can fail immediately (no privileges, bad socket). Give
-            # that a brief moment to surface so 'start' reports it instead of
-            # leaving a phantom "running" task.
-            thread = getattr(sniffer, "thread", None)
-            if thread is not None:
-                thread.join(0.1)
-            if thread is not None and not thread.is_alive():
-                exc = getattr(sniffer, "exception", None)
-                if exc is not None:
-                    raise ModuleError(f"Could not start capture: {exc}")
-                # Finished instantly with no error (e.g. count already met).
-                captured = [Packet.from_scapy(p) for p in getattr(sniffer, "results", None) or []]
-                self.packets.extend(captured)
-                return f"Capture finished immediately: {len(captured)} packet(s) added."
-
-            self._sniffer = sniffer
-            self._context = context
-            self._task = context.tasks.start(context.current_command, stop=self.stop)
-            self._log.info(
-                "Capture started (time=%s, count=%s, filters=%d)",
-                time, count, len(self.filters),
-            )
-
-        limits = []
-        if count:
-            limits.append(f"{count} packet(s)")
-        if time:
-            limits.append(f"{time}s")
-        suffix = f" (stops after {' or '.join(limits)})" if limits else ""
-        return f"Capture started in the background{suffix}. Use 'capture stop' to finish."
-
-    def stop(self) -> int:
-        """Stop the running capture, append its packets, return how many."""
-        with self._lock:
-            if self._sniffer is None:
-                raise ModuleError("No capture is currently running.")
-            count = self._finalize_locked()
-            if self._error is not None:
-                error, self._error = self._error, None
-                raise ModuleError(f"Capture ended with an error: {error}")
-            return count
-
-    def _finished_locked(self) -> bool:
-        """True once the background sniffer has stopped (cleanly or by crash)."""
-        sniffer = self._sniffer
-        if sniffer is None:
-            return False
-        thread = getattr(sniffer, "thread", None)
-        return not sniffer.running or (thread is not None and not thread.is_alive())
-
-    def _reap_locked(self) -> None:
-        """Finalize a capture that stopped on its own (timeout/count/crash)."""
-        if self._finished_locked():
-            self._finalize_locked()
-
-    def _finalize_locked(self) -> int:
-        sniffer = self._sniffer
-        if sniffer is None:
-            return 0
-        thread = getattr(sniffer, "thread", None)
-        if sniffer.running and thread is not None and thread.is_alive():
-            try:
-                sniffer.stop()
-            except Exception:  # noqa: BLE001 - stop races are non-fatal
-                self._log.exception("Error stopping sniffer")
-        self._error = getattr(sniffer, "exception", None)
-        results = list(getattr(sniffer, "results", None) or [])
-        # scapy tags packets with sniffed_on only when sniffing multiple
-        # sockets; when we captured on a single interface it may be empty, so
-        # stamp it ourselves for the inspect view.
-        fallback = self._capture_ifaces[0] if len(self._capture_ifaces) == 1 else None
-        captured = []
-        for pkt in results:
-            if fallback and not getattr(pkt, "sniffed_on", None):
-                pkt.sniffed_on = fallback
-            captured.append(Packet.from_scapy(pkt))
-        self._capture_ifaces = []
-        self.packets.extend(captured)
-        if self._task is not None and self._context is not None:
-            self._context.tasks.finish(self._task)
-        self._sniffer = None
-        self._task = None
-        self._context = None
-        self._log.info("Capture stopped: %d packet(s) added to session", len(captured))
-        return len(captured)
+        outcome = self._launch(
+            context, ifaces=selected, predicate=predicate, time=time, count=count
+        )
+        return self._start_message(
+            outcome, time, count,
+            noun="Capture", unit="packet", stop_hint="capture stop",
+        )
 
     # --- Session store --------------------------------------------------------
-
-    def clear(self) -> int:
-        with self._lock:
-            count = len(self.packets)
-            self.packets.clear()
-            self._log.info("Cleared %d session packet(s)", count)
-            return count
-
-    def export(self, fmt: str, filename: str) -> Path:
-        normalized = fmt.lower().lstrip(".")
-        if normalized != "pcap":
-            raise ModuleError(
-                f"Unsupported export format {fmt!r}; only 'pcap' is supported."
-            )
-        path = Path(filename)
-        if not path.is_absolute():
-            path = DEFAULT_EXPORT_DIR / path
-        with self._lock:
-            if not self.packets:
-                raise ModuleError("No packets to export; capture something first.")
-            try:
-                return self.write_pcap(path, list(self.packets), append=False)
-            except OSError as exc:
-                raise ModuleError(
-                    f"Could not write to {path}: {exc.strerror or exc}."
-                ) from exc
-
-    def import_file(self, fmt: str, filename: str) -> int:
-        normalized = fmt.lower().lstrip(".")
-        if normalized != "pcap":
-            raise ModuleError(
-                f"Unsupported import format {fmt!r}; only 'pcap' is supported."
-            )
-        path = Path(filename)
-        if not path.is_file():
-            raise ModuleError(f"File not found: {filename}.")
-        try:
-            packets = scapy_io.read_pcap(str(path))
-        except ModuleError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - surface any read/parse failure cleanly
-            raise ModuleError(f"Could not read {filename}: {exc}") from exc
-        with self._lock:
-            self.packets.extend(packets)
-        self._log.info("Imported %d packet(s) from %s", len(packets), path)
-        return len(packets)
 
     def summary(self) -> dict:
         with self._lock:
@@ -342,15 +179,3 @@ class CaptureService:
         if field == "port":
             if not value.isdigit() or not (0 <= int(value) <= 65535):
                 raise ValueError(f"Invalid port {value!r}; expected 0-65535.")
-
-    # --- pcap writing ---------------------------------------------------------
-
-    def write_pcap(
-        self, path: str | Path, packets: list[Packet], *, append: bool = True
-    ) -> Path:
-        """Write packets to ``path`` (creating parent dirs); returns the path."""
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        scapy_io.write_pcap(str(path), packets, append=append)
-        self._log.info("Wrote %d packet(s) to %s", len(packets), path)
-        return path

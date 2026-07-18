@@ -7,6 +7,7 @@ dependencies = [
     "netifaces2>=0.0.22",
     "pydantic>=2.13.4",
     "pydantic-settings>=2.14.1",
+    "pyric>=0.1.6.3",
     "scapy>=2.7.0",
     "typer>=0.26.8",
 ]

@@ -10,12 +10,62 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from scapy.layers.dot11 import Dot11, Dot11Elt, RadioTap
 from scapy.layers.l2 import ARP, Dot1Q, Ether  # noqa: F401 (Dot1Q re-exported)
 from scapy.layers.inet import ICMP, IP, TCP, UDP
 from scapy.layers.inet6 import IPv6
 from scapy.packet import Raw
 
 _IGNORED_LAYERS = {"Raw", "Padding", "NoPayload"}
+
+# 802.11 frame type / subtype -> short human names, used by :meth:`Packet.dot11_info`
+# and the wireless capture views. Subtypes are keyed by ``(type, subtype)`` because
+# subtype numbers are only unique within a type.
+_DOT11_TYPE_NAMES = {0: "mgmt", 1: "ctrl", 2: "data", 3: "ext"}
+_DOT11_SUBTYPE_NAMES = {
+    (0, 0): "assoc-req", (0, 1): "assoc-resp", (0, 2): "reassoc-req",
+    (0, 3): "reassoc-resp", (0, 4): "probe-req", (0, 5): "probe-resp",
+    (0, 8): "beacon", (0, 9): "atim", (0, 10): "disassoc", (0, 11): "auth",
+    (0, 12): "deauth", (0, 13): "action",
+    (1, 8): "bar", (1, 9): "ba", (1, 10): "ps-poll", (1, 11): "rts",
+    (1, 12): "cts", (1, 13): "ack", (1, 14): "cf-end", (1, 15): "cf-end-ack",
+    (2, 0): "data", (2, 4): "null", (2, 8): "qos-data", (2, 12): "qos-null",
+}
+
+
+def _norm_mac(value) -> str | None:
+    """Lower-cased MAC string, or ``None`` for a missing/absent address."""
+    return str(value).lower() if value else None
+
+
+def _dot11_ssid(pkt) -> str | None:
+    """Extract the SSID from an 802.11 frame's information elements.
+
+    Only management frames that carry an SSID element (beacon, probe req/resp,
+    (re)assoc req) have one. An empty SSID element means a hidden network; frames
+    without the element return ``None``.
+    """
+    elt = pkt.getlayer(Dot11Elt)
+    while isinstance(elt, Dot11Elt):
+        if elt.ID == 0:  # 0 == SSID element
+            try:
+                return elt.info.decode(errors="replace") or "<hidden>"
+            except Exception:  # noqa: BLE001 - a malformed element must not raise
+                return None
+        elt = elt.payload.getlayer(Dot11Elt)
+    return None
+
+
+def _radiotap_signal(pkt) -> int | None:
+    """Antenna signal in dBm from the RadioTap header, or ``None`` if absent."""
+    rt = pkt.getlayer(RadioTap)
+    if rt is None:
+        return None
+    value = getattr(rt, "dBm_AntSignal", None)
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 class Packet:
@@ -160,6 +210,15 @@ class Packet:
             eth = self._pkt[Ether]
             result["src_mac"] = eth.src
             result["dst_mac"] = eth.dst
+        if self._pkt.haslayer(Dot11):
+            dot11 = self._pkt[Dot11]
+            # 802.11 addressing: addr2 = transmitter (src), addr1 = receiver
+            # (dst), addr3 = BSSID. There is no Ether layer here, so this fills
+            # the src/dst the generic views expect.
+            result.setdefault("src_mac", dot11.addr2)
+            result.setdefault("dst_mac", dot11.addr1)
+            if dot11.addr3:
+                result["bssid"] = dot11.addr3
         if self._pkt.haslayer(IP):
             ip = self._pkt[IP]
             result["src_ip"] = ip.src
@@ -192,6 +251,36 @@ class Packet:
         if self._pkt.haslayer(Raw):
             result["payload"] = bytes(self._pkt[Raw].load)
         return result
+
+    def is_dot11(self) -> bool:
+        """Whether this is an 802.11 (Wi-Fi) frame, as seen in monitor mode."""
+        return self._pkt.haslayer(Dot11)
+
+    def dot11_info(self) -> dict:
+        """802.11 view of the frame, or ``{}`` for a non-802.11 packet.
+
+        Keys: ``type`` (mgmt/ctrl/data), ``subtype`` (beacon/probe-req/deauth/
+        ...), ``transmitter``/``receiver``/``bssid`` (the addr2/addr1/addr3
+        MACs), ``ssid`` (management frames only), and ``signal`` (dBm from the
+        RadioTap header, when present).
+        """
+        dot11 = self._pkt.getlayer(Dot11)
+        if dot11 is None:
+            return {}
+        try:
+            type_num = int(dot11.type)
+            subtype_num = int(dot11.subtype)
+        except (TypeError, ValueError):
+            type_num = subtype_num = -1
+        return {
+            "type": _DOT11_TYPE_NAMES.get(type_num, str(type_num)),
+            "subtype": _DOT11_SUBTYPE_NAMES.get((type_num, subtype_num), str(subtype_num)),
+            "receiver": _norm_mac(dot11.addr1),
+            "transmitter": _norm_mac(dot11.addr2),
+            "bssid": _norm_mac(dot11.addr3),
+            "ssid": _dot11_ssid(self._pkt),
+            "signal": _radiotap_signal(self._pkt),
+        }
 
     def timestamp(self) -> str:
         """Capture time as ``HH:MM:SS`` (``-`` if scapy did not record one)."""
