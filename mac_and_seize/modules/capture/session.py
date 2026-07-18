@@ -93,8 +93,16 @@ class PacketSession:
 
             self._error = None
             self._capture_ifaces = list(ifaces) if ifaces else []
+            # Pass a single interface as a plain string (scapy's canonical form)
+            # rather than a one-element list: the list form drives scapy's
+            # multi-socket select() path, which is unnecessary here and less
+            # battle-tested for monitor-mode (RadioTap/Dot11) sockets.
+            if ifaces and len(ifaces) == 1:
+                iface_arg = ifaces[0]
+            else:
+                iface_arg = ifaces or None
             sniffer = AsyncSniffer(
-                iface=ifaces or None,
+                iface=iface_arg,
                 lfilter=predicate,
                 store=True,
                 timeout=time or None,
@@ -164,10 +172,19 @@ class PacketSession:
             wrapped.append(Packet.from_scapy(pkt))
         return wrapped
 
+    def _stop_extra(self) -> None:
+        """Hook for subclasses to tear down auxiliary workers on finalize.
+
+        Called from :meth:`_finalize_locked` (under the lock) when a capture
+        ends, cleanly or otherwise. The wireless service overrides it to stop
+        its channel-sweep hopper. Default: nothing to do.
+        """
+
     def _finalize_locked(self) -> int:
         sniffer = self._sniffer
         if sniffer is None:
             return 0
+        self._stop_extra()
         thread = getattr(sniffer, "thread", None)
         if sniffer.running and thread is not None and thread.is_alive():
             try:

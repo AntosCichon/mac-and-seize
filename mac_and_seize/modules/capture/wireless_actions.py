@@ -1,9 +1,10 @@
 """Actions exposed by the capture module's ``capture wireless`` subgroup.
 
 802.11 monitor-mode capture: ``start`` / ``stop`` (background capture on a
-monitor interface), ``inspect`` (a scrollable Dot11 table) and a ``filter``
-subgroup (``add`` / ``remove`` / ``show``) over the wireless filter vocabulary.
-Handlers stay thin: they translate parsed values into calls on the
+monitor interface, optionally sweeping channels), ``activity`` (rank channels by
+traffic), ``inspect`` / ``networks`` / ``stations`` / ``summary`` views,
+``clear`` / ``export`` / ``import`` over the wireless store, and a ``filter``
+subgroup. Handlers stay thin: they translate parsed values into calls on the
 session-scoped :class:`WirelessCaptureService` and return plain data.
 """
 
@@ -14,6 +15,7 @@ from typing import TYPE_CHECKING
 from mac_and_seize.core.actions import Action, Param
 from mac_and_seize.core.presenter import Column
 from mac_and_seize.modules.capture.wireless_filters import FIELDS
+from mac_and_seize.modules.capture.wireless_service import DEFAULT_DWELL_MS
 
 if TYPE_CHECKING:
     from mac_and_seize.core.context import AppContext
@@ -43,7 +45,12 @@ def _service(context: "AppContext") -> "WirelessCaptureService":
 
 def _start(context: "AppContext", values: dict) -> str:
     return _service(context).start(
-        context, values["interface"], time=values.get("time"), count=values.get("count")
+        context,
+        values["interface"],
+        time=values.get("time"),
+        count=values.get("count"),
+        sweep=values.get("sweep"),
+        interval=values.get("interval"),
     )
 
 
@@ -53,12 +60,61 @@ def _stop(context: "AppContext", values: dict) -> str:
     return f"Wireless capture stopped: {added} frame(s) added ({len(service.packets)} in session)."
 
 
+def _activity(context: "AppContext", values: dict):
+    rows, rejected = _service(context).scan_activity(
+        values["interface"],
+        values.get("channels") or "all",
+        values.get("dwell") or DEFAULT_DWELL_MS,
+    )
+    if not rows:
+        return "No channels could be scanned (the card may not tune any of them)."
+    if rejected:
+        # Surface the exclusion as the first row so it renders with the table.
+        rows = [{"channel": f"excluded: {rejected}", "frames": "-", "beacons": "-",
+                 "bytes": "not IEEE 802.11 channels"}] + rows
+    return rows
+
+
 def _inspect(context: "AppContext", values: dict):
     rows = _service(context).inspect_rows()
     if not rows:
         return "No 802.11 frames captured yet; run 'capture wireless start <iface>' first."
     context.presenter.table(rows, _INSPECT_COLUMNS, title="Captured 802.11 frames")
     return None
+
+
+def _networks(context: "AppContext", values: dict):
+    rows = _service(context).networks()
+    if not rows:
+        return "No access points seen yet (no beacons/probe responses captured)."
+    return rows
+
+
+def _stations(context: "AppContext", values: dict):
+    rows = _service(context).stations()
+    if not rows:
+        return "No client stations seen yet."
+    return rows
+
+
+def _summary(context: "AppContext", values: dict) -> dict:
+    return _service(context).summary()
+
+
+def _clear(context: "AppContext", values: dict) -> str:
+    cleared = _service(context).clear()
+    return f"Cleared {cleared} frame(s) from the wireless session."
+
+
+def _export(context: "AppContext", values: dict) -> str:
+    path = _service(context).export(values["format"], values["filename"])
+    return f"Exported wireless session frames to {path}."
+
+
+def _import(context: "AppContext", values: dict) -> str:
+    service = _service(context)
+    added = service.import_file(values["format"], values["filename"])
+    return f"Imported {added} frame(s) from {values['filename']} ({len(service.packets)} in session)."
 
 
 def _filter_add(context: "AppContext", values: dict) -> list[dict]:
@@ -87,8 +143,11 @@ def build_wireless_actions() -> list[Action]:
             "Start 802.11 capture",
             "Start capturing 802.11 frames in the background on a monitor-mode "
             "interface, using the current wireless filter set. The interface must "
-            "already be in monitor mode (see 'interface mode') and tuned to a "
-            "channel (see 'interface channel'). The prompt stays usable while it "
+            "already be in monitor mode (see 'interface mode'). Give --sweep to "
+            "pick the channel(s): a single channel is tuned for the whole capture, "
+            "while a list/range/'all' hops across them every --interval ms. "
+            "Without --sweep the interface's current channel is used (monitor mode "
+            "only sees one channel at a time). The prompt stays usable while it "
             "runs; stop it with 'capture wireless stop' (requires root).",
             _start,
             [
@@ -96,21 +155,48 @@ def build_wireless_actions() -> list[Action]:
                 Param("time", "Stop after N seconds (whole capture)", int,
                       required=False),
                 Param("count", "Stop after N frames", int, required=False),
+                Param("sweep", "Channel(s): a number, list (1,6,11), range (1-11), or 'all'",
+                      required=False),
+                Param("interval", "Milliseconds between channel hops (default 250)", int,
+                      required=False),
             ],
             [
                 "capture wireless start wlan0",
-                "capture wireless start wlan0 --time 30",
-                "capture wireless start wlan0 --count 500 --time 60",
+                "capture wireless start wlan0 --sweep 6",
+                "capture wireless start wlan0 --sweep 1,6,11 --interval 300",
+                "capture wireless start wlan0 --sweep all --time 60",
             ],
             requires_root=True,
         ),
         Action(
             "capture.wireless.stop",
             "Stop 802.11 capture",
-            "Stop the running 802.11 capture and append its frames to the "
-            "wireless session (requires root).",
+            "Stop the running 802.11 capture (and its channel sweep, if any) and "
+            "append its frames to the wireless session (requires root).",
             _stop,
             examples=["capture wireless stop"],
+            requires_root=True,
+        ),
+        Action(
+            "capture.wireless.activity",
+            "Scan channel activity",
+            "Dwell briefly on each channel and rank them by traffic (frames, "
+            "beacons, bytes) so you can pick the busiest channels for a --sweep. "
+            "Requires monitor mode and blocks for roughly len(channels) x --dwell; "
+            "the interface's original channel is restored afterwards (requires root).",
+            _activity,
+            [
+                Param("interface", "Monitor-mode interface to scan on (e.g. wlan0)"),
+                Param("channels", "Channels to scan: number, list, range, or 'all' (default all)",
+                      required=False),
+                Param("dwell", "Milliseconds to dwell per channel (default 250)", int,
+                      required=False),
+            ],
+            [
+                "capture wireless activity wlan0",
+                "capture wireless activity wlan0 --channels 1-11",
+                "capture wireless activity wlan0 --channels 1,6,11 --dwell 500",
+            ],
             requires_root=True,
         ),
         Action(
@@ -121,6 +207,62 @@ def build_wireless_actions() -> list[Action]:
             "Navigate with the arrow keys; press Esc, Enter or q to exit.",
             _inspect,
             examples=["capture wireless inspect"],
+        ),
+        Action(
+            "capture.wireless.networks",
+            "Show access points",
+            "List the access points seen this session (SSID, BSSID, channel, "
+            "signal, beacon count), built from captured beacons/probe responses "
+            "and sorted by beacon count.",
+            _networks,
+            examples=["capture wireless networks"],
+        ),
+        Action(
+            "capture.wireless.stations",
+            "Show client stations",
+            "List the client stations seen this session and the AP they talk to, "
+            "built from captured data/probe frames and sorted by frame count.",
+            _stations,
+            examples=["capture wireless stations"],
+        ),
+        Action(
+            "capture.wireless.summary",
+            "802.11 capture summary",
+            "Show a summary of the wireless session: total frames, unique "
+            "BSSIDs/SSIDs, a frame type/subtype breakdown, and filter/capture state.",
+            _summary,
+            examples=["capture wireless summary"],
+        ),
+        Action(
+            "capture.wireless.clear",
+            "Clear 802.11 frames",
+            "Discard all 802.11 frames captured so far this session.",
+            _clear,
+            examples=["capture wireless clear"],
+        ),
+        Action(
+            "capture.wireless.export",
+            "Export 802.11 frames",
+            "Export the wireless session's frames to a pcap file (openable in "
+            "Wireshark). Relative paths are written under 'exports/'.",
+            _export,
+            [
+                Param("format", "Output format (only 'pcap')"),
+                Param("filename", "Destination file path (relative -> exports/)"),
+            ],
+            ["capture wireless export pcap wifi.pcap"],
+        ),
+        Action(
+            "capture.wireless.import",
+            "Import 802.11 frames",
+            "Read 802.11 frames from a pcap file and append them to the wireless "
+            "session.",
+            _import,
+            [
+                Param("format", "Input format (only 'pcap')"),
+                Param("filename", "Source file path"),
+            ],
+            ["capture wireless import pcap wifi.pcap"],
         ),
         Action(
             "capture.wireless.filter.add",

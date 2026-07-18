@@ -6,13 +6,23 @@ It reuses the shared background-capture lifecycle
 single monitor-mode interface, filters with the 802.11 vocabulary
 (bssid/ssid/type/subtype), and inspects frames as Dot11 rather than Ethernet.
 
+On top of Phase-1 capture it adds:
+
+* **channel sweep** - ``start(..., sweep=...)`` tunes a single channel for the
+  whole capture, or hops across a list/range/``all`` every ``interval`` ms via a
+  background hopper thread (monitor mode only sees one channel at a time);
+* an **activity scan** - :meth:`scan_activity` briefly dwells on each channel and
+  ranks them by traffic, so the busiest channels can be chosen for a sweep;
+* **network/station views** aggregated from the captured frames.
+
 Registered as a **second** service of the capture module (key
 ``"capture_wireless"``) so the wired and wireless stores/filters stay separate.
-Sniffing requires root; the CLI gates the actions.
+Sniffing and tuning require root; the CLI gates the actions.
 """
 
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING
 
 from mac_and_seize.core.errors import ModuleError
@@ -27,10 +37,19 @@ from mac_and_seize.modules.capture.wireless_filters import (
     build_wireless_predicate,
 )
 from mac_and_seize.net import MacAddress
-from mac_and_seize.net.adapters import wireless
+from mac_and_seize.net.adapters import scapy_io, wireless
 
 if TYPE_CHECKING:
     from mac_and_seize.core.context import AppContext
+
+#: Default milliseconds between channel hops when sweeping several channels.
+#: ~250 ms is about two beacon intervals (a beacon is sent every 102.4 ms), so
+#: each visit reliably catches a beacon while still cycling quickly - a fast
+#: activity sweep rather than steady single-channel monitoring.
+DEFAULT_HOP_INTERVAL_MS = 250
+
+#: Default milliseconds to dwell on each channel during an activity scan.
+DEFAULT_DWELL_MS = 250
 
 
 class WirelessCaptureService(PacketSession):
@@ -40,6 +59,8 @@ class WirelessCaptureService(PacketSession):
         super().__init__()
         self.filters: list[WirelessFilter] = []
         self._next_id = 1
+        self._hopper_stop: threading.Event | None = None
+        self._hopper_thread: threading.Thread | None = None
 
     # --- Background capture ---------------------------------------------------
 
@@ -50,28 +71,200 @@ class WirelessCaptureService(PacketSession):
         *,
         time: int | None = None,
         count: int | None = None,
+        sweep: str | None = None,
+        interval: int | None = None,
     ) -> str:
-        """Start a background 802.11 capture on a monitor-mode ``interface``."""
-        interface = (interface or "").strip()
-        if not interface:
-            raise ValueError("Specify the monitor-mode interface to capture on.")
-        if not wireless.is_wireless(interface):
-            raise ModuleError(f"{interface!r} is not a wireless interface.")
-        mode = wireless.current_mode(interface)
-        if mode != "monitor":
-            raise ModuleError(
-                f"{interface!r} is in {mode!r} mode; run "
-                f"'interface mode {interface} monitor' first."
-            )
+        """Start a background 802.11 capture on a monitor-mode ``interface``.
+
+        ``sweep`` optionally selects the channel(s): a single channel is tuned
+        for the whole capture; a list/range/``all`` hops across them every
+        ``interval`` ms (default :data:`DEFAULT_HOP_INTERVAL_MS`).
+        """
+        interface = self._require_monitor(interface)
+        if interval is not None and interval <= 0:
+            raise ValueError("--interval must be a positive number of milliseconds.")
+
+        hop_channels: list[int] | None = None
+        rejected: list[int] = []
+        if sweep:
+            valid, rejected = wireless.validate_channels(self._parse_channels(sweep))
+            if not valid:
+                raise ValueError("No valid IEEE 802.11 channels to sweep.")
+            if len(valid) == 1:
+                wireless.set_channel(interface, valid[0])
+            else:
+                hop_channels = valid
+
         with self._lock:
             predicate = build_wireless_predicate(self.filters)
         outcome = self._launch(
             context, ifaces=[interface], predicate=predicate, time=time, count=count
         )
-        return self._start_message(
-            outcome, time, count,
-            noun="Wireless capture", unit="frame", stop_hint="capture wireless stop",
+
+        hop_interval = interval or DEFAULT_HOP_INTERVAL_MS
+        # Only spin up the hopper once the sniffer is actually running.
+        if hop_channels and outcome[0] == "started":
+            self._start_hopper(interface, hop_channels, hop_interval)
+
+        return self._compose_start_message(
+            interface, outcome, time, count, hop_channels, hop_interval, rejected
         )
+
+    def _compose_start_message(
+        self, interface, outcome, time, count, hop_channels, hop_interval, rejected
+    ) -> str:
+        kind, n = outcome
+        try:
+            channel = wireless.current_channel(interface)
+        except ModuleError:
+            channel = None
+
+        if hop_channels:
+            where = (
+                f"sweeping channels {','.join(map(str, hop_channels))} "
+                f"every {hop_interval}ms"
+            )
+        else:
+            where = f"channel {channel if channel is not None else 'unset'}"
+        head = f"Wireless capture on {interface} ({where})"
+
+        reject_note = ""
+        if rejected:
+            reject_note = (
+                f" channels {rejected} are not IEEE 802.11 defined Wi-Fi channels, "
+                "they've been excluded from sweep."
+            )
+
+        if kind == "immediate":
+            return f"{head} finished immediately: {n} frame(s) added.{reject_note}"
+
+        limits = []
+        if count:
+            limits.append(f"{count} frame(s)")
+        if time:
+            limits.append(f"{time}s")
+        suffix = f" (stops after {' or '.join(limits)})" if limits else ""
+        message = (
+            f"{head} started in the background{suffix}. "
+            "Use 'capture wireless stop' to finish."
+        )
+        if not hop_channels and channel is None:
+            message += (
+                f" WARNING: no channel is set on {interface}; monitor capture only "
+                f"sees one channel at a time - set one with 'interface channel "
+                f"{interface} <n>' or pass --sweep."
+            )
+        return message + reject_note
+
+    # --- Channel sweep (hopper) ----------------------------------------------
+
+    def _start_hopper(self, interface: str, channels: list[int], interval_ms: int) -> None:
+        """Spawn a background thread that retunes ``interface`` across ``channels``."""
+        stop = threading.Event()
+
+        def run() -> None:
+            index = 0
+            while not stop.is_set():
+                channel = channels[index % len(channels)]
+                try:
+                    wireless.set_channel(interface, channel)
+                except Exception as exc:  # noqa: BLE001 - a bad channel must not kill the sweep
+                    self._log.warning(
+                        "Sweep: could not tune %s to channel %d: %s",
+                        interface, channel, exc,
+                    )
+                index += 1
+                stop.wait(interval_ms / 1000.0)
+
+        thread = threading.Thread(target=run, name="wl-channel-hopper", daemon=True)
+        with self._lock:
+            self._hopper_stop = stop
+            self._hopper_thread = thread
+        thread.start()
+        self._log.info(
+            "Channel hopper started on %s (%d channels, %dms)",
+            interface, len(channels), interval_ms,
+        )
+
+    def _stop_extra(self) -> None:
+        """Stop the channel hopper (called from the base on capture finalize)."""
+        stop, thread = self._hopper_stop, self._hopper_thread
+        self._hopper_stop = None
+        self._hopper_thread = None
+        if stop is not None:
+            stop.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+
+    # --- Activity scan --------------------------------------------------------
+
+    def scan_activity(
+        self, interface: str, channels_spec: str, dwell_ms: int
+    ) -> tuple[list[dict], list[int]]:
+        """Dwell briefly on each channel and rank them by traffic volume.
+
+        ``channels_spec`` is a channel number, list, range, or ``all``. Returns
+        ``(rows, rejected)``: ``rows`` are one dict per scanned channel
+        (frames/beacons/bytes), sorted busiest first; ``rejected`` are requested
+        channels that are not IEEE 802.11 channels. Blocks for roughly
+        ``len(channels) x dwell``. The interface's original channel is restored
+        afterwards.
+        """
+        interface = self._require_monitor(interface)
+        if self.is_capturing():
+            raise ModuleError(
+                "A wireless capture is running; stop it before scanning activity."
+            )
+        if dwell_ms <= 0:
+            raise ValueError("--dwell must be a positive number of milliseconds.")
+        valid, rejected = wireless.validate_channels(self._parse_channels(channels_spec))
+        if rejected:
+            self._log.info(
+                "activity: excluding non-IEEE channels %s", rejected
+            )
+        if not valid:
+            raise ValueError("No valid IEEE 802.11 channels to scan.")
+
+        try:
+            original = wireless.current_channel(interface)
+        except ModuleError:
+            original = None
+
+        rows: list[dict] = []
+        try:
+            for channel in valid:
+                try:
+                    wireless.set_channel(interface, channel)
+                except wireless.WirelessError as exc:
+                    self._log.info(
+                        "activity: skipping channel %d on %s: %s", channel, interface, exc
+                    )
+                    continue
+                packets = scapy_io.sniff(interface, timeout=max(dwell_ms / 1000.0, 0.01))
+                beacons = 0
+                byte_total = 0
+                for packet in packets:
+                    if packet.dot11_info().get("subtype") == "beacon":
+                        beacons += 1
+                    try:
+                        byte_total += len(packet.build())
+                    except Exception:  # noqa: BLE001 - never let one frame abort the scan
+                        pass
+                rows.append({
+                    "channel": channel,
+                    "frames": len(packets),
+                    "beacons": beacons,
+                    "bytes": byte_total,
+                })
+        finally:
+            if original is not None:
+                try:
+                    wireless.set_channel(interface, original)
+                except ModuleError:
+                    pass
+
+        rows.sort(key=lambda row: (row["frames"], row["bytes"]), reverse=True)
+        return rows, rejected
 
     # --- Session views --------------------------------------------------------
 
@@ -90,7 +283,7 @@ class WirelessCaptureService(PacketSession):
             info = packet.dot11_info()
             if info.get("bssid"):
                 bssids.add(info["bssid"])
-            if info.get("ssid"):
+            if info.get("ssid") and info["ssid"] != "<hidden>":
                 ssids.add(info["ssid"])
             label = f"{info.get('type', '-')}/{info.get('subtype', '-')}"
             subtypes[label] = subtypes.get(label, 0) + 1
@@ -102,6 +295,69 @@ class WirelessCaptureService(PacketSession):
             "active_filters": active_filters,
             "capturing": capturing,
         }
+
+    def networks(self) -> list[dict]:
+        """Access points seen, aggregated from beacons/probe responses."""
+        with self._lock:
+            packets = list(self.packets)
+        aps: dict[str, dict] = {}
+        for packet in packets:
+            info = packet.dot11_info()
+            if info.get("subtype") not in ("beacon", "probe-resp"):
+                continue
+            bssid = info.get("bssid")
+            if not bssid:
+                continue
+            ap = aps.setdefault(bssid, {
+                "bssid": bssid, "ssid": "-", "channel": "-", "signal": "-", "beacons": 0,
+            })
+            if info.get("subtype") == "beacon":
+                ap["beacons"] += 1
+            ssid = info.get("ssid")
+            if ssid and ssid != "<hidden>":
+                ap["ssid"] = ssid
+            elif ap["ssid"] == "-" and ssid == "<hidden>":
+                ap["ssid"] = "<hidden>"
+            if info.get("channel") is not None:
+                ap["channel"] = info["channel"]
+            if info.get("signal") is not None:
+                ap["signal"] = info["signal"]
+        return sorted(aps.values(), key=lambda ap: ap["beacons"], reverse=True)
+
+    def stations(self) -> list[dict]:
+        """Client stations seen, with the AP they talk to (from data/probe frames)."""
+        with self._lock:
+            packets = list(self.packets)
+        # Frames that don't identify a client transmitter (AP-originated or
+        # address-less control frames) are skipped.
+        skip = {"beacon", "probe-resp", "ack", "cts", "rts", "ba", "bar",
+                "cf-end", "cf-end-ack"}
+        stations: dict[str, dict] = {}
+        for packet in packets:
+            info = packet.dot11_info()
+            if info.get("subtype") in skip:
+                continue
+            transmitter = info.get("transmitter")
+            bssid = info.get("bssid")
+            if not transmitter or transmitter == "ff:ff:ff:ff:ff:ff":
+                continue
+            if transmitter == bssid:  # frame from the AP itself, not a client
+                continue
+            station = stations.setdefault(transmitter, {
+                "station": transmitter, "bssid": "-", "frames": 0, "signal": "-",
+            })
+            station["frames"] += 1
+            # Prefer a real AP BSSID over the broadcast address a probe request
+            # carries, and don't let broadcast overwrite a known association.
+            if (
+                bssid
+                and bssid != "ff:ff:ff:ff:ff:ff"
+                and station["bssid"] in ("-", "ff:ff:ff:ff:ff:ff")
+            ):
+                station["bssid"] = bssid
+            if info.get("signal") is not None:
+                station["signal"] = info["signal"]
+        return sorted(stations.values(), key=lambda s: s["frames"], reverse=True)
 
     def inspect_rows(self) -> list[dict]:
         with self._lock:
@@ -123,6 +379,40 @@ class WirelessCaptureService(PacketSession):
                 "ssid": part("ssid"),
             })
         return rows
+
+    # --- Helpers --------------------------------------------------------------
+
+    def _require_monitor(self, interface: str) -> str:
+        """Validate ``interface`` is a monitor-mode 802.11 NIC; return it stripped."""
+        interface = (interface or "").strip()
+        if not interface:
+            raise ValueError("Specify the monitor-mode interface.")
+        if not wireless.is_wireless(interface):
+            raise ModuleError(f"{interface!r} is not a wireless interface.")
+        mode = wireless.current_mode(interface)
+        if mode != "monitor":
+            raise ModuleError(
+                f"{interface!r} is in {mode!r} mode; run "
+                f"'interface mode {interface} monitor' first."
+            )
+        return interface
+
+    @staticmethod
+    def _parse_channels(spec: str) -> list[int]:
+        """Parse a channel spec: a number, a comma list, a range, or ``all``."""
+        spec = spec.strip().lower()
+        if spec == "all":
+            return wireless.ieee_channels()
+        channels: list[int] = []
+        for value in split_values(spec):
+            if not value.isdigit():
+                raise ValueError(
+                    f"Invalid channel {value!r}; expected a number, list, range, or 'all'."
+                )
+            channels.append(int(value))
+        if not channels:
+            raise ValueError("No channels given.")
+        return channels
 
     # --- Filters --------------------------------------------------------------
 

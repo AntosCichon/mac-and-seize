@@ -56,6 +56,23 @@ def _dot11_ssid(pkt) -> str | None:
     return None
 
 
+def _dot11_channel(pkt) -> int | None:
+    """Advertised channel from the DS Parameter Set element (ID 3).
+
+    Present in beacons and probe responses; it is the network's operating
+    channel regardless of which channel we were tuned to when we heard it.
+    """
+    elt = pkt.getlayer(Dot11Elt)
+    while isinstance(elt, Dot11Elt):
+        if elt.ID == 3 and elt.info:
+            try:
+                return int(elt.info[0])
+            except (TypeError, ValueError, IndexError):
+                return None
+        elt = elt.payload.getlayer(Dot11Elt)
+    return None
+
+
 def _radiotap_signal(pkt) -> int | None:
     """Antenna signal in dBm from the RadioTap header, or ``None`` if absent."""
     rt = pkt.getlayer(RadioTap)
@@ -279,6 +296,7 @@ class Packet:
             "transmitter": _norm_mac(dot11.addr2),
             "bssid": _norm_mac(dot11.addr3),
             "ssid": _dot11_ssid(self._pkt),
+            "channel": _dot11_channel(self._pkt),
             "signal": _radiotap_signal(self._pkt),
         }
 
