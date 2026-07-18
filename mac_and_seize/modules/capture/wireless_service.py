@@ -120,10 +120,23 @@ class WirelessCaptureService(PacketSession):
         if hop_channels and outcome[0] == "started":
             self._start_hopper(interface, hop_channels, hop_interval)
 
-        return self._compose_start_message(
+        message = self._compose_start_message(
             interface, outcome, time, count, hop_channels, hop_interval,
             rejected, unsupported,
         )
+        # When sweeping, a radio shared with a managed/connected interface is
+        # pinned to that interface's channel and the hopper silently can't move -
+        # warn up front rather than let it look like there's just no traffic.
+        if hop_channels:
+            siblings = wireless.phy_siblings(interface)
+            if siblings:
+                others = ", ".join(f"{dev} ({mode})" for dev, mode in siblings)
+                message += (
+                    f" NOTE: this radio is also used by {others}; if a connection "
+                    "manager holds it the sweep cannot change channel - run "
+                    "'sudo airmon-ng check kill' to free the radio."
+                )
+        return message
 
     def _compose_start_message(
         self, interface, outcome, time, count, hop_channels, hop_interval,
@@ -257,15 +270,22 @@ class WirelessCaptureService(PacketSession):
         except ModuleError:
             original = None
 
-        rows: list[dict] = []
+        ok_rows: list[dict] = []
+        failed_rows: list[dict] = []
         try:
             for channel in valid:
                 try:
                     wireless.set_channel(interface, channel)
                 except wireless.WirelessError as exc:
-                    self._log.info(
-                        "activity: skipping channel %d on %s: %s", channel, interface, exc
+                    # A channel that won't tune is a finding, not noise: show it
+                    # so a radio pinned to one channel is visible at a glance.
+                    self._log.debug(
+                        "activity: channel %d on %s failed: %s", channel, interface, exc
                     )
+                    failed_rows.append({
+                        "channel": channel, "frames": "-", "beacons": "-",
+                        "bytes": "-", "status": "tune failed (radio busy?)",
+                    })
                     continue
                 packets = scapy_io.sniff(interface, timeout=max(dwell_ms / 1000.0, 0.01))
                 beacons = 0
@@ -277,11 +297,12 @@ class WirelessCaptureService(PacketSession):
                         byte_total += len(packet.build())
                     except Exception:  # noqa: BLE001 - never let one frame abort the scan
                         pass
-                rows.append({
+                ok_rows.append({
                     "channel": channel,
                     "frames": len(packets),
                     "beacons": beacons,
                     "bytes": byte_total,
+                    "status": "ok",
                 })
         finally:
             if original is not None:
@@ -290,8 +311,26 @@ class WirelessCaptureService(PacketSession):
                 except ModuleError:
                     pass
 
-        rows.sort(key=lambda row: (row["frames"], row["bytes"]), reverse=True)
-        return rows, rejected
+        ok_rows.sort(key=lambda row: (row["frames"], row["bytes"]), reverse=True)
+        return ok_rows + failed_rows, rejected
+
+    def radio_hint(self, interface: str) -> str:
+        """A one-line, actionable reason a channel change is being refused.
+
+        Names the sibling interface(s) holding the radio when there are any -
+        the usual cause of 'device busy' when tuning - and points at the fix.
+        """
+        siblings = wireless.phy_siblings(interface)
+        if siblings:
+            others = ", ".join(f"{dev} ({mode})" for dev, mode in siblings)
+            return (
+                f"this radio is shared with {others}; a connection manager holding "
+                "it pins the channel. Run 'sudo airmon-ng check kill' first."
+            )
+        return (
+            "the channel would not change (device busy) - run 'sudo airmon-ng "
+            "check kill' to release the radio from NetworkManager/wpa_supplicant."
+        )
 
     # --- Session views --------------------------------------------------------
 

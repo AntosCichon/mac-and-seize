@@ -61,18 +61,25 @@ def _stop(context: "AppContext", values: dict) -> str:
 
 
 def _activity(context: "AppContext", values: dict):
-    rows, rejected = _service(context).scan_activity(
+    service = _service(context)
+    rows, rejected = service.scan_activity(
         values["interface"],
         values.get("channels") or "all",
         values.get("dwell") or DEFAULT_DWELL_MS,
     )
     if not rows:
         return "No channels could be scanned (the card may not tune any of them)."
+    table: list[dict] = []
     if rejected:
-        # Surface the exclusion as the first row so it renders with the table.
-        rows = [{"channel": f"excluded: {rejected}", "frames": "-", "beacons": "-",
-                 "bytes": "not IEEE 802.11 channels"}] + rows
-    return rows
+        table.append({"channel": f"excluded {rejected}", "frames": "-", "beacons": "-",
+                      "bytes": "-", "status": "not IEEE 802.11 channels"})
+    table.extend(rows)
+    # If channels refused to tune, a radio pinned to one channel is the usual
+    # cause; append a one-line, actionable explanation as a final note row.
+    if any(str(row.get("status", "")).startswith("tune failed") for row in rows):
+        table.append({"channel": "note", "frames": "-", "beacons": "-",
+                      "bytes": "-", "status": service.radio_hint(values["interface"])})
+    return table
 
 
 def _inspect(context: "AppContext", values: dict):

@@ -116,6 +116,27 @@ def _card(name: str):
         raise WirelessError(f"Could not open wireless device {name!r}: {exc}") from exc
 
 
+def phy_siblings(name: str) -> list[tuple[str, str]]:
+    """Other interfaces sharing this card's radio (PHY), as ``(dev, mode)``.
+
+    A monitor interface cannot change channel while another interface on the
+    same radio is in use: nl80211 pins the whole PHY to the channel that
+    interface is associated on, so ``set_channel`` fails with "device busy" for
+    every other channel. Listing the siblings lets callers explain a stuck
+    sweep. Excludes the interface itself; returns ``[]`` on any error.
+    """
+    try:
+        card = _card(name)
+        return [
+            (sibling.dev, mode)
+            for sibling, mode in pyw.ifaces(card)
+            if sibling.dev != name
+        ]
+    except (pyric.error, WirelessError, OSError) as exc:
+        _log.debug("Could not list PHY siblings of %s: %s", name, exc)
+        return []
+
+
 def current_mode(name: str) -> str:
     """Return the interface's 802.11 mode (e.g. ``'monitor'``, ``'managed'``)."""
     card = _card(name)
