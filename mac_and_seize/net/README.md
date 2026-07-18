@@ -18,6 +18,8 @@ pieces instead of defining them.
 
 ```
 net/
+  session.py    PacketSession — shared background packet-capture session base
+                (packet store + AsyncSniffer lifecycle, pcap export/import)
   model/        pure domain types — NO I/O, NO subprocess/scapy calls
     addresses.py   MacAddress, IPAddress, CIDR   (self-validating value objects)
     route.py       Route                          (value object + is_autorecreated)
@@ -28,9 +30,16 @@ net/
     ip.py          link/addr/route ops via `ip`, + sysfs read_state/is_up
     ethtool.py     get_permanent_mac() via SIOCETHTOOL ioctl
     netifaces_io.py list_names(), read_addresses()
-    scapy_io.py    send(), sniff(), write/read_pcap(), available_interfaces(), expand_hosts(), arp/icmp_probe()
-    wireless.py    is_wireless(), set_mode(), set_channel(), current_mode/channel(), ieee/validate_channels()  (nl80211 via PyRIC)
+    scapy_io.py    send(), sniff(), write/read_pcap(), available_interfaces(), refresh_interfaces(), expand_hosts(), arp_probe()
+    wireless.py    is_wireless/set_mode/set_channel(verified)/current_*, ieee/validate_channels,
+                   PHY topology (list_phys/phy_of/interfaces_on_phy), add_monitor/del_interface,
+                   interfering_daemons  (nl80211 via PyRIC)
 ```
+
+`session.py` sits at the top of `net/` (not under `model/` or `adapters/`): it is
+neither a pure type nor a thin OS wrapper but a shared *base service* two modules
+need (`capture`, `wireless`), so by the dependency rule it lives below the modules
+here. It imports only `net`/`core`/scapy — never a feature module.
 
 ## Dependency rule
 

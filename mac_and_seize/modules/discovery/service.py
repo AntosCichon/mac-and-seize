@@ -141,7 +141,7 @@ class DiscoveryService:
         context: "AppContext",
         target: str,
         *,
-        timeout: int | None = None,
+        timeout: float | None = None,
     ) -> str:
         """Start a background ARP host-discovery scan against ``target``."""
         target = target.strip()
@@ -357,15 +357,13 @@ class DiscoveryService:
             methods[host.method] = methods.get(host.method, 0) + 1
         # Logical = unique IP addresses (one per stored host); physical = unique
         # MAC addresses. A host with several IPs on one NIC is many logical
-        # addresses but a single physical one, so the headline reports both and
-        # sums them (this is also why 'list' can show fewer rows than logical).
+        # addresses but a single physical one (which is why 'list' can show fewer
+        # rows than the logical count).
         logical = len(hosts)
         physical = len({host.mac for host in hosts if host.mac})
         return {
-            "found": (
-                f"{logical + physical} unique addresses "
-                f"({logical} logical, {physical} physical)"
-            ),
+            "logical_addresses": logical,
+            "physical_hosts": physical,
             "with_mac": sum(1 for host in hosts if host.mac),
             "with_vendor": sum(1 for host in hosts if host.vendor),
             "by_method": ", ".join(f"{k}={v}" for k, v in sorted(methods.items())),

@@ -8,7 +8,7 @@ scapy's :class:`AsyncSniffer` so the interactive prompt stays responsive; the
 captured packets are appended to the session on stop.
 
 The background-capture lifecycle (starting/reaping/stopping the sniffer and the
-packet store) lives in the shared :class:`~mac_and_seize.modules.capture.session.PacketSession`
+packet store) lives in the shared :class:`~mac_and_seize.net.session.PacketSession`
 base, so this class only adds the **wired** concerns: the include/exclude filter
 set, socket-level interface selection, and the summary/inspect views.
 """
@@ -25,10 +25,10 @@ from mac_and_seize.modules.capture.filters import (
     Filter,
     build_predicate,
     select_interfaces,
-    split_values,
 )
-from mac_and_seize.modules.capture.session import PacketSession
 from mac_and_seize.net.adapters import scapy_io
+from mac_and_seize.net.session import PacketSession
+from mac_and_seize.util.parse import split_values
 
 if TYPE_CHECKING:
     from mac_and_seize.core.context import AppContext

@@ -58,13 +58,26 @@ Self-contained, auto-discovered feature packages. See
 | `service.py` | `InterfaceService` — parses input into `net` value objects, composes the `ip`/`ethtool`/`netifaces` adapters to build and mutate `Interface` entities, owns the registry and route-preservation workflow. |
 | `actions.py` | The `interface` command tree: `list`, `show`, `state.up/down`, `mac`, `ip4.add/remove/set`, `ip6.add/remove/set`. |
 
-**`capture/`** — sniff and record packets.
+**`capture/`** — sniff and record wired packets.
 
 | File | Purpose |
 | --- | --- |
-| `service.py` | `CaptureService` — session store (packets, filters), background `AsyncSniffer` lifecycle, pcap export/import; uses `net.adapters.scapy_io` and the shared `Packet`. |
+| `service.py` | `CaptureService` — the wired capture service: include/exclude filters, socket-level interface selection, summary/inspect; builds on the shared `net.session.PacketSession` (packet store + `AsyncSniffer` lifecycle). |
 | `filters.py` | Structured include/exclude capture filters and the per-packet matching engine. |
 | `actions.py` | The `capture` command group (start/stop/export/import/clear/summary/inspect + `filter` subgroup). |
+
+**`wireless/`** — 802.11 (Wi-Fi) monitor-mode capture; a peer of `capture/`, kept
+separate because its operational model (monitor mode, channel hopping, PHY
+lifecycle, driver/daemon coordination, and planned injection tooling) differs from
+wired sniffing. Entering monitor mode exists only to enable capture, so it is done
+quietly inside `capture start` and undone on `stop` (route-preservation style) —
+there is no separate monitor/mode/channel command surface.
+
+| File | Purpose |
+| --- | --- |
+| `capture.py` | `WirelessCaptureService` — monitor-mode frame capture on `net.session.PacketSession`; also owns the quiet monitor setup/teardown (switch a managed interface to monitor, or create a monitor VIF on a free PHY, and restore on stop), channel sweeping (background hopper), activity scan, and network/station views. |
+| `filters.py` | Structured 802.11 include/exclude filters (bssid/ssid/type/subtype) and the matching engine. |
+| `actions.py` | The `wireless` command group: `capture` (start/stop/inspect/networks/stations/summary/clear/export/import + `filter`) and `activity`. |
 
 **`discovery/`** — find live hosts on the network (service/port discovery is a
 stub for now).
@@ -86,10 +99,12 @@ model/adapters split and dependency rule).
 | `model/route.py` | `Route` — a routing-table entry value object. |
 | `model/interface.py` | `Interface` — the pure interface entity (data + `to_dict`, no I/O). |
 | `model/packet.py` | `Packet` — the scapy packet wrapper (factories, layer access, summaries). |
+| `session.py` | `PacketSession` — shared background packet-capture session base (packet store + `AsyncSniffer` lifecycle, pcap export/import), reused by the `capture` and `wireless` modules. |
 | `adapters/ip.py` | Link/address/route operations via `ip`, plus sysfs `read_state`/`is_up`. |
 | `adapters/ethtool.py` | `get_permanent_mac()` via a raw `SIOCETHTOOL` ioctl. |
 | `adapters/netifaces_io.py` | Interface enumeration and address records via `netifaces`. |
-| `adapters/scapy_io.py` | `send()`, `sniff()`, `write_pcap()`, `read_pcap()`, `available_interfaces()`, and host discovery (`expand_hosts()`, `arp_probe()`, `icmp_probe()`, `mac_vendor()`). |
+| `adapters/scapy_io.py` | `send()`, `sniff()`, `write_pcap()`, `read_pcap()`, `available_interfaces()`, `refresh_interfaces()`, and host discovery (`expand_hosts()`, `arp_probe()`, `mac_vendor()`). |
+| `adapters/wireless.py` | 802.11 control via nl80211/PyRIC: monitor mode, verified channel set, PHY topology (`list_phys`/`phy_of`/`interfaces_on_phy`), monitor-VIF create/teardown (`add_monitor`/`del_interface`), and `interfering_daemons()`. |
 | `adapters/privileged.py` | `run()` (privileged-subprocess helper), `PrivilegedCommandError`, `family_flag()`. |
 
 ### `config/`
@@ -116,6 +131,7 @@ model/adapters split and dependency rule).
 | File | Purpose |
 | --- | --- |
 | `system.py` | `is_root()`, `relaunch_as_root()`. |
+| `parse.py` | `split_values()` — expand one CLI token into a list/range of values (shared by the `capture` and `wireless` modules). |
 | `export.py` | `archive()` and `export_logs()` — zips log files into the export directory. |
 | `format.py` | `format_hms()` — render a duration in seconds as `HH:MM:SS`. |
 | `static.py` | ANSI color codes, log-level colors, and the startup banner. |

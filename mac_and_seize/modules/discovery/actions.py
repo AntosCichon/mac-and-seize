@@ -92,7 +92,7 @@ def build_actions() -> list[Action]:
                 Param(
                     "timeout",
                     "Seconds to wait for ARP replies (default: 0.5)",
-                    int,
+                    float,
                     required=False,
                 ),
             ],

@@ -90,7 +90,8 @@ Field-by-field:
   display order within your module.
 - **`group_descriptions`** — optional labels for your command groups (see §6).
 - **`order`** — controls where your module's groups/commands appear relative to
-  other modules. Existing modules use `interface=10`, `capture=20`. Default 100.
+  other modules. Existing modules use `interface=10`, `capture=20`,
+  `wireless=25`, `discovery=40`. Default 100.
 
 ---
 
@@ -103,7 +104,7 @@ Field-by-field:
 class Param:
     name: str            # value key handed to your handler
     help: str            # one-line description shown in help
-    type: type = str     # str or int (int is parsed/validated for you)
+    type: type = str     # str, int, or float (int/float parsed/validated for you)
     required: bool = True
     default: Any = None  # used when an optional param is omitted
     multiple: bool = False  # accept a list/range; handler runs once per value
@@ -143,8 +144,8 @@ def handler(context: AppContext, values: dict) -> Any: ...
 ```
 
 - `values` is `{param.name: parsed_value}`. Required params are positional in the
-  CLI; optional params are passed as `--name value`. `int` params arrive already
-  converted; missing optional params arrive as their `default`.
+  CLI; optional params are passed as `--name value`. `int`/`float` params arrive
+  already converted; missing optional params arrive as their `default`.
 - Keep handlers **thin**: fetch your service, call it, return plain data. Do not
   print, and do not put business logic in the handler.
 - Return types are rendered generically by every front-end:

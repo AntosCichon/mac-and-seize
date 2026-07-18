@@ -1,17 +1,19 @@
-"""Shared background-capture lifecycle for the capture module's services.
+"""Shared background-capture lifecycle for packet-capture services.
 
 Both the wired :class:`~mac_and_seize.modules.capture.service.CaptureService`
 and the wireless
-:class:`~mac_and_seize.modules.capture.wireless_service.WirelessCaptureService`
-run a scapy :class:`AsyncSniffer` in the background, accumulate the captured
+:class:`~mac_and_seize.modules.wireless.capture.WirelessCaptureService` run a
+scapy :class:`AsyncSniffer` in the background, accumulate the captured
 :class:`~mac_and_seize.net.Packet`\\ s in a per-session store, and expose the same
 store operations (clear/export/import). That common machinery lives here as a
 base class so neither service reimplements the sniffer lifecycle. What differs
 per service - how interfaces and the packet predicate are chosen, and how
 packets are filtered/summarised/inspected - stays in the subclass.
 
-This is module-internal (see modules/README.md §9 on background work); it is not
-shared vocabulary, so it stays in the module rather than in ``net/``.
+Because more than one module needs it, this base lives in the shared ``net/``
+layer below the modules (see net/README.md and modules/README.md §8) rather than
+inside any one module - two modules must never import one another. It touches
+only ``net``/``core``/scapy, never a feature module.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from typing import TYPE_CHECKING
 from scapy.all import AsyncSniffer
 
 from mac_and_seize.core.errors import ModuleError
-from mac_and_seize.net import Packet
+from mac_and_seize.net.model.packet import Packet
 from mac_and_seize.net.adapters import scapy_io
 from mac_and_seize.observability import get_logger
 
@@ -138,7 +140,7 @@ class PacketSession:
         with self._lock:
             if self._sniffer is None:
                 raise ModuleError("No capture is currently running.")
-            count = self._finalize_locked()
+            count = self._finalize_locked(reaped=False)
             if self._error is not None:
                 error, self._error = self._error, None
                 raise ModuleError(f"Capture ended with an error: {error}")
@@ -155,7 +157,7 @@ class PacketSession:
     def _reap_locked(self) -> None:
         """Finalize a capture that stopped on its own (timeout/count/crash)."""
         if self._finished_locked():
-            self._finalize_locked()
+            self._finalize_locked(reaped=True)
 
     def _wrap(self, results) -> list[Packet]:
         """Wrap raw scapy packets, stamping the capture interface when needed.
@@ -172,19 +174,23 @@ class PacketSession:
             wrapped.append(Packet.from_scapy(pkt))
         return wrapped
 
-    def _stop_extra(self) -> None:
+    def _stop_extra(self, *, reaped: bool = False) -> None:
         """Hook for subclasses to tear down auxiliary workers on finalize.
 
         Called from :meth:`_finalize_locked` (under the lock) when a capture
-        ends, cleanly or otherwise. The wireless service overrides it to stop
-        its channel-sweep hopper. Default: nothing to do.
+        ends, cleanly or otherwise. ``reaped`` is True when the capture finished
+        on its own (time/count) and is being finalized lazily by a later command
+        rather than stopped explicitly by the user - a subclass can use it to
+        surface out-of-band notes that no ``stop`` handler will otherwise read.
+        The wireless service overrides it to stop its channel-sweep hopper.
+        Default: nothing to do.
         """
 
-    def _finalize_locked(self) -> int:
+    def _finalize_locked(self, *, reaped: bool = False) -> int:
         sniffer = self._sniffer
         if sniffer is None:
             return 0
-        self._stop_extra()
+        self._stop_extra(reaped=reaped)
         thread = getattr(sniffer, "thread", None)
         if sniffer.running and thread is not None and thread.is_alive():
             try:

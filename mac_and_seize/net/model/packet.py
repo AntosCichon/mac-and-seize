@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from scapy.layers.dot11 import Dot11, Dot11Elt, RadioTap
+from scapy.layers.dot11 import Dot11, Dot11Beacon, Dot11Elt, Dot11ProbeResp, RadioTap
 from scapy.layers.l2 import ARP, Dot1Q, Ether  # noqa: F401 (Dot1Q re-exported)
 from scapy.layers.inet import ICMP, IP, TCP, UDP
 from scapy.layers.inet6 import IPv6
@@ -83,6 +83,68 @@ def _radiotap_signal(pkt) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _rsn_akm_suites(info: bytes) -> set[int]:
+    """AKM suite type numbers from an RSN (ID 48) information-element body.
+
+    The suite type is the last byte of each 4-byte ``00-0F-AC-XX`` selector; it
+    tells WPA3 (SAE = 8) apart from WPA2 (PSK = 2, 802.1X = 1, ...). Returns an
+    empty set if the element is truncated or malformed.
+    """
+    try:
+        i = 2 + 4  # skip version (2 bytes) + group cipher suite (4 bytes)
+        pair_count = int.from_bytes(info[i:i + 2], "little")
+        i += 2 + 4 * pair_count  # skip the pairwise cipher suite list
+        akm_count = int.from_bytes(info[i:i + 2], "little")
+        i += 2
+        suites: set[int] = set()
+        for _ in range(akm_count):
+            selector = info[i:i + 4]
+            i += 4
+            if len(selector) == 4:
+                suites.add(selector[3])
+        return suites
+    except Exception:  # noqa: BLE001 - a truncated element must not raise
+        return set()
+
+
+def _dot11_security(pkt) -> str | None:
+    """Security of a beacon/probe response: Open/WEP/WPA/WPA2/WPA3 (or mixed).
+
+    Combines the Privacy capability bit with the RSN (ID 48) and WPA vendor
+    (ID 221, Microsoft OUI) information elements: RSN AKM suites distinguish WPA3
+    (SAE) from WPA2, and transition modes read as e.g. ``WPA2/WPA3``. Returns
+    ``None`` for a frame without a capability field (not a beacon/probe response).
+    """
+    body = pkt.getlayer(Dot11Beacon) or pkt.getlayer(Dot11ProbeResp)
+    if body is None:
+        return None
+    privacy = bool(getattr(body.cap, "privacy", False))
+
+    has_rsn = has_wpa = False
+    akms: set[int] = set()
+    elt = pkt.getlayer(Dot11Elt)
+    while isinstance(elt, Dot11Elt):
+        try:
+            info = bytes(elt.info) if elt.info else b""
+            if elt.ID == 48:  # RSN element -> WPA2/WPA3
+                has_rsn = True
+                akms |= _rsn_akm_suites(info)
+            elif elt.ID == 221 and info[:4] == b"\x00\x50\xf2\x01":  # WPA1 (MS OUI)
+                has_wpa = True
+        except Exception:  # noqa: BLE001 - one bad element must not abort the scan
+            pass
+        elt = elt.payload.getlayer(Dot11Elt)
+
+    if has_rsn:
+        wpa3 = bool(akms & {8, 9})               # SAE, FT-SAE
+        wpa2 = bool(akms & {1, 2, 3, 4, 5, 6}) or not akms
+        label = "WPA2/WPA3" if wpa3 and wpa2 else "WPA3" if wpa3 else "WPA2"
+        return f"WPA/{label}" if has_wpa else label
+    if has_wpa:
+        return "WPA"
+    return "WEP" if privacy else "Open"
 
 
 class Packet:
@@ -278,8 +340,9 @@ class Packet:
 
         Keys: ``type`` (mgmt/ctrl/data), ``subtype`` (beacon/probe-req/deauth/
         ...), ``transmitter``/``receiver``/``bssid`` (the addr2/addr1/addr3
-        MACs), ``ssid`` (management frames only), and ``signal`` (dBm from the
-        RadioTap header, when present).
+        MACs), ``ssid`` (management frames only), ``channel``, ``signal`` (dBm
+        from the RadioTap header, when present), and ``security``
+        (Open/WEP/WPA/WPA2/WPA3, beacons/probe responses only).
         """
         dot11 = self._pkt.getlayer(Dot11)
         if dot11 is None:
@@ -298,6 +361,7 @@ class Packet:
             "ssid": _dot11_ssid(self._pkt),
             "channel": _dot11_channel(self._pkt),
             "signal": _radiotap_signal(self._pkt),
+            "security": _dot11_security(self._pkt),
         }
 
     def timestamp(self) -> str:

@@ -40,6 +40,19 @@ def available_interfaces() -> list[str]:
     return get_if_list()
 
 
+def refresh_interfaces() -> None:
+    """Rebuild scapy's interface cache so newly-created NICs are visible.
+
+    scapy resolves an interface *name* to its ``ifindex`` through a cache
+    (``conf.ifaces``) built at import time. A monitor interface created at
+    command time is therefore absent (or a same-named one deleted and recreated
+    now carries a stale ifindex), and sniffing on it fails with ``ENODEV``
+    ([Errno 19] No such device). Call this right after adding or re-typing an
+    interface, before opening a socket on it.
+    """
+    conf.ifaces.reload()
+
+
 def expand_hosts(target: str) -> list[str]:
     """Expand a scan ``target`` into an explicit list of host addresses.
 

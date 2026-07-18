@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from mac_and_seize.net import CIDR, IPAddress, Interface, MacAddress, Route
-from mac_and_seize.net.adapters import ethtool, ip, netifaces_io, wireless
+from mac_and_seize.net.adapters import ethtool, ip, netifaces_io
 from mac_and_seize.observability import get_logger
 
 
@@ -82,39 +82,6 @@ class InterfaceService:
             iface.state,
         )
         return iface.state
-
-    def set_mode(self, name: str, mode: str) -> str:
-        """Switch a wireless interface between ``monitor`` and ``managed`` mode.
-
-        Only valid on 802.11 interfaces; a wired or non-existent interface is
-        rejected with a :class:`ValueError`. The link is briefly cycled by the
-        wireless adapter to change type. Returns the applied mode.
-        """
-        mode = mode.strip().lower()
-        if mode not in ("monitor", "managed"):
-            raise ValueError(f"Invalid mode {mode!r}; expected 'monitor' or 'managed'.")
-        self._require_wireless(name)
-        wireless.set_mode(name, mode)
-        self._log.info("Set %s to %s mode", name, mode)
-        return mode
-
-    def set_channel(self, name: str, channel: int) -> int:
-        """Tune a monitor-mode wireless interface to an IEEE 802.11 ``channel``.
-
-        Only valid on 802.11 interfaces already in monitor mode (enforced by the
-        wireless adapter). Returns the applied channel number.
-        """
-        self._require_wireless(name)
-        wireless.set_channel(name, channel)
-        self._log.info("Set %s to channel %d", name, channel)
-        return channel
-
-    def _require_wireless(self, name: str) -> None:
-        """Raise a clear error unless ``name`` is an existing 802.11 interface."""
-        if name not in netifaces_io.list_names():
-            raise ValueError(f"Interface {name!r} does not exist.")
-        if not wireless.is_wireless(name):
-            raise ValueError(f"{name!r} is not a wireless interface.")
 
     def set_mac(
         self, name: str, mac: str, *, preserve_routes: bool = True

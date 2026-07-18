@@ -488,6 +488,13 @@ def _convert(param, token: str):
             raise UsageError(
                 f"'{token}' is not a valid integer for '{param.name}'."
             ) from exc
+    if param.type is float:
+        try:
+            return float(token)
+        except ValueError as exc:
+            raise UsageError(
+                f"'{token}' is not a valid number for '{param.name}'."
+            ) from exc
     return token
 
 

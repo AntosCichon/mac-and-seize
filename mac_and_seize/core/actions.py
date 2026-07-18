@@ -38,7 +38,7 @@ class Param:
 
     name: str
     help: str
-    type: type = str  # ``str`` or ``int``
+    type: type = str  # ``str``, ``int`` or ``float`` (int/float parsed for you)
     required: bool = True
     default: Any = None
     multiple: bool = False

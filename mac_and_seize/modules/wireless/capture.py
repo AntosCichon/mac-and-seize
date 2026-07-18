@@ -1,12 +1,13 @@
 """802.11 (monitor-mode) capture session service.
 
-The wireless counterpart to :class:`~mac_and_seize.modules.capture.service.CaptureService`.
-It reuses the shared background-capture lifecycle
-(:class:`~mac_and_seize.modules.capture.session.PacketSession`) but captures on a
-single monitor-mode interface, filters with the 802.11 vocabulary
+The wireless counterpart to the wired
+:class:`~mac_and_seize.modules.capture.service.CaptureService`. It reuses the
+shared background-capture lifecycle
+(:class:`~mac_and_seize.net.session.PacketSession`) but captures on a single
+monitor-mode interface, filters with the 802.11 vocabulary
 (bssid/ssid/type/subtype), and inspects frames as Dot11 rather than Ethernet.
 
-On top of Phase-1 capture it adds:
+On top of plain capture it adds:
 
 * **channel sweep** - ``start(..., sweep=...)`` tunes a single channel for the
   whole capture, or hops across a list/range/``all`` every ``interval`` ms via a
@@ -15,8 +16,8 @@ On top of Phase-1 capture it adds:
   ranks them by traffic, so the busiest channels can be chosen for a sweep;
 * **network/station views** aggregated from the captured frames.
 
-Registered as a **second** service of the capture module (key
-``"capture_wireless"``) so the wired and wireless stores/filters stay separate.
+Registered by the :mod:`mac_and_seize.modules.wireless` module under the key
+``"wireless_capture"``, separate from the wired ``"capture"`` store/filters.
 Sniffing and tuning require root; the CLI gates the actions.
 """
 
@@ -26,9 +27,7 @@ import threading
 from typing import TYPE_CHECKING
 
 from mac_and_seize.core.errors import ModuleError
-from mac_and_seize.modules.capture.filters import split_values
-from mac_and_seize.modules.capture.session import PacketSession
-from mac_and_seize.modules.capture.wireless_filters import (
+from mac_and_seize.modules.wireless.filters import (
     ACTIONS,
     FIELDS,
     SUBTYPE_NAMES,
@@ -38,6 +37,8 @@ from mac_and_seize.modules.capture.wireless_filters import (
 )
 from mac_and_seize.net import MacAddress
 from mac_and_seize.net.adapters import scapy_io, wireless
+from mac_and_seize.net.session import PacketSession
+from mac_and_seize.util.parse import split_values
 
 if TYPE_CHECKING:
     from mac_and_seize.core.context import AppContext
@@ -61,59 +62,75 @@ class WirelessCaptureService(PacketSession):
         self._next_id = 1
         self._hopper_stop: threading.Event | None = None
         self._hopper_thread: threading.Thread | None = None
+        self._hopper_stuck = False
+        # How to restore the radio when the capture stops (route-preservation
+        # style): set by _ensure_monitor, consumed by _teardown_monitor.
+        self._monitor_undo: dict | None = None
+        self._teardown_note = ""
 
     # --- Background capture ---------------------------------------------------
 
     def start(
         self,
         context: "AppContext",
-        interface: str,
+        target: str | None = None,
         *,
         time: int | None = None,
         count: int | None = None,
         sweep: str | None = None,
         interval: int | None = None,
     ) -> str:
-        """Start a background 802.11 capture on a monitor-mode ``interface``.
+        """Start a background 802.11 capture, preparing monitor mode as needed.
 
-        ``sweep`` optionally selects the channel(s): a single channel is tuned
-        for the whole capture; a list/range/``all`` hops across them every
-        ``interval`` ms (default :data:`DEFAULT_HOP_INTERVAL_MS`).
+        ``target`` is a wireless interface, a PHY (``phy0``), or omitted to use
+        the only radio. The radio is put into monitor mode quietly and restored
+        when the capture stops (see :meth:`_ensure_monitor`) - the tool never
+        stops a connection manager itself. ``sweep`` selects the channel(s): a
+        single channel is tuned for the whole capture; a list/range/``all`` hops
+        across them every ``interval`` ms (default :data:`DEFAULT_HOP_INTERVAL_MS`).
         """
-        interface = self._require_monitor(interface)
+        if self.is_capturing():
+            raise ModuleError("A wireless capture is already running. Stop it first.")
         if interval is not None and interval <= 0:
             raise ValueError("--interval must be a positive number of milliseconds.")
 
-        hop_channels: list[int] | None = None
-        rejected: list[int] = []
-        unsupported: list[int] = []
-        if sweep:
-            valid, rejected = wireless.validate_channels(self._parse_channels(sweep))
-            if not valid:
-                raise ValueError("No valid IEEE 802.11 channels to sweep.")
-            # Keep only channels the radio can actually tune. A 2.4 GHz-only card
-            # asked to sweep 'all' would otherwise spend most of the cycle failing
-            # to set 5 GHz channels - parked on one channel, so only that channel's
-            # networks are seen.
-            supported = set(wireless.supported_channels(interface))
-            tunable = [c for c in valid if c in supported]
-            unsupported = [c for c in valid if c not in supported]
-            if not tunable:
-                raise ModuleError(
-                    f"{interface} cannot tune any of the requested channel(s) "
-                    f"{valid}. It may be a 2.4 GHz-only radio, or these are "
-                    "5 GHz/DFS channels the driver does not support."
-                )
-            if len(tunable) == 1:
-                wireless.set_channel(interface, tunable[0])
-            else:
-                hop_channels = tunable
+        interface = self._ensure_monitor(target)
+        try:
+            hop_channels: list[int] | None = None
+            rejected: list[int] = []
+            unsupported: list[int] = []
+            if sweep:
+                valid, rejected = wireless.validate_channels(self._parse_channels(sweep))
+                if not valid:
+                    raise ValueError("No valid IEEE 802.11 channels to sweep.")
+                # Keep only channels the radio can actually tune. A 2.4 GHz-only
+                # card asked to sweep 'all' would otherwise spend most of the cycle
+                # failing to set 5 GHz channels - parked on one channel, so only
+                # that channel's networks are seen.
+                supported = set(wireless.supported_channels(interface))
+                tunable = [c for c in valid if c in supported]
+                unsupported = [c for c in valid if c not in supported]
+                if not tunable:
+                    raise ModuleError(
+                        f"{interface} cannot tune any of the requested channel(s) "
+                        f"{valid}. It may be a 2.4 GHz-only radio, or these are "
+                        "5 GHz/DFS channels the driver does not support."
+                    )
+                if len(tunable) == 1:
+                    wireless.set_channel(interface, tunable[0])
+                else:
+                    hop_channels = tunable
 
-        with self._lock:
-            predicate = build_wireless_predicate(self.filters)
-        outcome = self._launch(
-            context, ifaces=[interface], predicate=predicate, time=time, count=count
-        )
+            with self._lock:
+                predicate = build_wireless_predicate(self.filters)
+            outcome = self._launch(
+                context, ifaces=[interface], predicate=predicate, time=time, count=count
+            )
+        except BaseException:
+            # Setup put the radio in monitor mode but the capture could not start
+            # - undo it so the interface is not stranded in monitor mode.
+            self._teardown_monitor(note=False)
+            raise
 
         hop_interval = interval or DEFAULT_HOP_INTERVAL_MS
         # Only spin up the hopper once the sniffer is actually running.
@@ -129,6 +146,7 @@ class WirelessCaptureService(PacketSession):
         # warn up front rather than let it look like there's just no traffic.
         if hop_channels:
             siblings = wireless.phy_siblings(interface)
+            daemons = wireless.interfering_daemons()
             if siblings:
                 others = ", ".join(f"{dev} ({mode})" for dev, mode in siblings)
                 message += (
@@ -136,6 +154,19 @@ class WirelessCaptureService(PacketSession):
                     "manager holds it the sweep cannot change channel - run "
                     "'sudo airmon-ng check kill' to free the radio."
                 )
+            elif daemons:
+                message += (
+                    f" NOTE: {', '.join(daemons)} is running and can pin this radio "
+                    "to its associated channel, leaving the sweep stuck on one "
+                    "channel - run 'sudo airmon-ng check kill' to free the radio."
+                )
+        # A capture that finished instantly has nothing to stop, so restore the
+        # radio now; otherwise tell the user how/when connectivity comes back.
+        if outcome[0] == "immediate":
+            self._teardown_monitor()
+            message += self.pop_teardown_note()
+        else:
+            message += self._monitor_notice()
         return message
 
     def _compose_start_message(
@@ -180,13 +211,12 @@ class WirelessCaptureService(PacketSession):
         suffix = f" (stops after {' or '.join(limits)})" if limits else ""
         message = (
             f"{head} started in the background{suffix}. "
-            "Use 'capture wireless stop' to finish."
+            "Use 'wireless capture stop' to finish."
         )
         if not hop_channels and channel is None:
             message += (
                 f" WARNING: no channel is set on {interface}; monitor capture only "
-                f"sees one channel at a time - set one with 'interface channel "
-                f"{interface} <n>' or pass --sweep."
+                "sees one channel at a time - pass --sweep <channel> to choose one."
             )
         return message + reject_note
 
@@ -195,20 +225,35 @@ class WirelessCaptureService(PacketSession):
     def _start_hopper(self, interface: str, channels: list[int], interval_ms: int) -> None:
         """Spawn a background thread that retunes ``interface`` across ``channels``."""
         stop = threading.Event()
+        self._hopper_stuck = False
 
         def run() -> None:
             index = 0
+            consecutive_failures = 0
+            warned = False
             while not stop.is_set():
                 channel = channels[index % len(channels)]
                 try:
                     wireless.set_channel(interface, channel)
+                    consecutive_failures = 0
                 except Exception as exc:  # noqa: BLE001 - a bad channel must not kill the sweep
+                    consecutive_failures += 1
                     # Debug, not warning: a DFS channel can refuse repeatedly and
                     # this runs every hop - it must not flood the prompt.
                     self._log.debug(
                         "Sweep: could not tune %s to channel %d: %s",
                         interface, channel, exc,
                     )
+                    # But a whole cycle failing to move the radio means the sweep
+                    # is stuck on one channel - which looks exactly like 'no
+                    # traffic'. Flag it and warn once with the actionable cause.
+                    if not warned and consecutive_failures >= len(channels):
+                        self._hopper_stuck = True
+                        self._log.warning(
+                            "Channel sweep on %s is stuck on one channel: %s",
+                            interface, self.radio_hint(interface),
+                        )
+                        warned = True
                 index += 1
                 stop.wait(interval_ms / 1000.0)
 
@@ -222,8 +267,15 @@ class WirelessCaptureService(PacketSession):
             interface, len(channels), interval_ms,
         )
 
-    def _stop_extra(self) -> None:
-        """Stop the channel hopper (called from the base on capture finalize)."""
+    def _stop_extra(self, *, reaped: bool = False) -> None:
+        """On capture finalize: stop the hopper, then undo any monitor setup.
+
+        When ``reaped`` (the capture hit its --time/--count limit and is being
+        finalized lazily by a later command, not stopped by the user), no ``stop``
+        handler will pop the teardown note, so deliver it out of band via the
+        presenter - otherwise the restored-connectivity message, or a
+        restore-*failure* warning, is silently lost.
+        """
         stop, thread = self._hopper_stop, self._hopper_thread
         self._hopper_stop = None
         self._hopper_thread = None
@@ -231,28 +283,44 @@ class WirelessCaptureService(PacketSession):
             stop.set()
         if thread is not None and thread.is_alive():
             thread.join(timeout=2.0)
+        # Restore the radio to how we found it (revert to managed / remove VIF).
+        self._teardown_monitor()
+        if reaped and self._context is not None:
+            note = self.pop_teardown_note()
+            if note:
+                self._context.presenter.notify(f"Wireless capture finished.{note}")
 
     # --- Activity scan --------------------------------------------------------
 
     def scan_activity(
-        self, interface: str, channels_spec: str, dwell_ms: int
+        self, target: str | None, channels_spec: str, dwell_ms: int
     ) -> tuple[list[dict], list[int]]:
         """Dwell briefly on each channel and rank them by traffic volume.
 
+        ``target`` is a wireless interface, a PHY, or omitted for the only radio;
+        it is put into monitor mode for the scan and restored afterwards (the
+        scan is transient, so unlike ``capture start`` the switch is silent).
         ``channels_spec`` is a channel number, list, range, or ``all``. Returns
         ``(rows, rejected)``: ``rows`` are one dict per scanned channel
         (frames/beacons/bytes), sorted busiest first; ``rejected`` are requested
         channels that are not IEEE 802.11 channels. Blocks for roughly
-        ``len(channels) x dwell``. The interface's original channel is restored
-        afterwards.
+        ``len(channels) x dwell``.
         """
-        interface = self._require_monitor(interface)
         if self.is_capturing():
             raise ModuleError(
                 "A wireless capture is running; stop it before scanning activity."
             )
         if dwell_ms <= 0:
             raise ValueError("--dwell must be a positive number of milliseconds.")
+        interface = self._ensure_monitor(target)
+        try:
+            return self._run_activity(interface, channels_spec, dwell_ms)
+        finally:
+            self._teardown_monitor(note=False)
+
+    def _run_activity(
+        self, interface: str, channels_spec: str, dwell_ms: int
+    ) -> tuple[list[dict], list[int]]:
         valid, rejected = wireless.validate_channels(self._parse_channels(channels_spec))
         if rejected:
             self._log.info(
@@ -314,22 +382,33 @@ class WirelessCaptureService(PacketSession):
         ok_rows.sort(key=lambda row: (row["frames"], row["bytes"]), reverse=True)
         return ok_rows + failed_rows, rejected
 
-    def radio_hint(self, interface: str) -> str:
+    def radio_hint(self, interface: str | None = None) -> str:
         """A one-line, actionable reason a channel change is being refused.
 
-        Names the sibling interface(s) holding the radio when there are any -
-        the usual cause of 'device busy' when tuning - and points at the fix.
+        Names whatever is most likely holding the radio: a sibling interface on
+        the same PHY (only checkable when ``interface`` is given and still
+        exists), or a running connection manager (the usual cause on a
+        single-interface card, where there is no sibling to point at). Falls back
+        to the driver-can't-retune case (e.g. Realtek rtw88 in monitor mode).
         """
-        siblings = wireless.phy_siblings(interface)
+        siblings = wireless.phy_siblings(interface) if interface else []
         if siblings:
             others = ", ".join(f"{dev} ({mode})" for dev, mode in siblings)
             return (
                 f"this radio is shared with {others}; a connection manager holding "
                 "it pins the channel. Run 'sudo airmon-ng check kill' first."
             )
+        daemons = wireless.interfering_daemons()
+        if daemons:
+            return (
+                f"{', '.join(daemons)} is running and holds the radio on its "
+                "associated channel. Run 'sudo airmon-ng check kill' (or 'sudo "
+                f"systemctl stop {daemons[0]}') and retry."
+            )
         return (
-            "the channel would not change (device busy) - run 'sudo airmon-ng "
-            "check kill' to release the radio from NetworkManager/wpa_supplicant."
+            "the radio would not change channel. Either a connection manager is "
+            "holding it (run 'sudo airmon-ng check kill'), or the driver cannot "
+            "retune in monitor mode (common on Realtek rtw88 cards)."
         )
 
     # --- Session views --------------------------------------------------------
@@ -341,7 +420,10 @@ class WirelessCaptureService(PacketSession):
             capturing = self._sniffer is not None
             active_filters = len(self.filters)
         if not packets:
-            return {"frames": 0, "active_filters": active_filters, "capturing": capturing}
+            base = {"frames": 0, "active_filters": active_filters, "capturing": capturing}
+            if self._hopper_stuck:
+                base["channel_hopping"] = "stuck (radio won't leave one channel)"
+            return base
         bssids: set[str] = set()
         ssids: set[str] = set()
         subtypes: dict[str, int] = {}
@@ -353,7 +435,7 @@ class WirelessCaptureService(PacketSession):
                 ssids.add(info["ssid"])
             label = f"{info.get('type', '-')}/{info.get('subtype', '-')}"
             subtypes[label] = subtypes.get(label, 0) + 1
-        return {
+        result = {
             "frames": len(packets),
             "unique_bssids": len(bssids),
             "unique_ssids": len(ssids),
@@ -361,6 +443,9 @@ class WirelessCaptureService(PacketSession):
             "active_filters": active_filters,
             "capturing": capturing,
         }
+        if self._hopper_stuck:
+            result["channel_hopping"] = "stuck (radio won't leave one channel)"
+        return result
 
     def networks(self) -> list[dict]:
         """Access points seen, aggregated from beacons/probe responses."""
@@ -375,7 +460,8 @@ class WirelessCaptureService(PacketSession):
             if not bssid:
                 continue
             ap = aps.setdefault(bssid, {
-                "bssid": bssid, "ssid": "-", "channel": "-", "signal": "-", "beacons": 0,
+                "bssid": bssid, "ssid": "-", "security": "-", "channel": "-",
+                "signal": "-", "beacons": 0,
             })
             if info.get("subtype") == "beacon":
                 ap["beacons"] += 1
@@ -384,6 +470,8 @@ class WirelessCaptureService(PacketSession):
                 ap["ssid"] = ssid
             elif ap["ssid"] == "-" and ssid == "<hidden>":
                 ap["ssid"] = "<hidden>"
+            if info.get("security"):
+                ap["security"] = info["security"]
             if info.get("channel") is not None:
                 ap["channel"] = info["channel"]
             if info.get("signal") is not None:
@@ -448,20 +536,130 @@ class WirelessCaptureService(PacketSession):
 
     # --- Helpers --------------------------------------------------------------
 
-    def _require_monitor(self, interface: str) -> str:
-        """Validate ``interface`` is a monitor-mode 802.11 NIC; return it stripped."""
-        interface = (interface or "").strip()
-        if not interface:
-            raise ValueError("Specify the monitor-mode interface.")
-        if not wireless.is_wireless(interface):
-            raise ModuleError(f"{interface!r} is not a wireless interface.")
-        mode = wireless.current_mode(interface)
-        if mode != "monitor":
+    def _resolve_target(self, target: str) -> tuple[str, str]:
+        """Resolve ``target`` to ``('iface', name)`` or ``('phy', phy)``.
+
+        ``target`` may be a wireless interface, a PHY (``phy0``), or empty to
+        auto-pick the sole radio - its interface if it has exactly one, else the
+        PHY itself (the case after iwd was stopped and ``wlan0`` disappeared).
+        """
+        target = (target or "").strip()
+        if target:
+            if wireless.is_wireless(target):
+                return ("iface", target)
+            if target in wireless.list_phys():
+                return ("phy", target)
             raise ModuleError(
-                f"{interface!r} is in {mode!r} mode; run "
-                f"'interface mode {interface} monitor' first."
+                f"{target!r} is not a wireless interface or PHY. Pass a wireless "
+                "interface (e.g. wlan0), a PHY (e.g. phy0), or nothing to use the "
+                "only radio."
             )
-        return interface
+        phys = wireless.list_phys()
+        if not phys:
+            raise ModuleError("No wireless radios found on this system.")
+        if len(phys) > 1:
+            raise ModuleError(
+                f"Several radios present ({', '.join(phys)}); name the interface "
+                "or PHY to capture on."
+            )
+        ifaces = wireless.interfaces_on_phy(phys[0])
+        if len(ifaces) == 1:
+            return ("iface", ifaces[0][0])
+        if not ifaces:
+            return ("phy", phys[0])
+        raise ModuleError(
+            f"Several interfaces on {phys[0]} "
+            f"({', '.join(dev for dev, _ in ifaces)}); name the one to capture on."
+        )
+
+    def _ensure_monitor(self, target: str | None) -> str:
+        """Return a monitor-mode interface for ``target``, preparing one if needed.
+
+        Does the setup quietly and records how to undo it (:meth:`_teardown_monitor`)
+        so stopping the capture restores the radio - route-preservation style:
+
+        * an interface already in monitor mode is used as-is (left untouched);
+        * a managed interface is switched to monitor (reverted on stop);
+        * an idle PHY gets a fresh monitor VIF (removed on stop).
+
+        It never stops a connection manager itself: if one is holding the radio it
+        raises with the command to free it, rather than fighting it or dropping
+        the link uncleanly.
+        """
+        kind, ref = self._resolve_target(target)
+        if kind == "iface":
+            mode = wireless.current_mode(ref)
+            if mode == "monitor":
+                self._monitor_undo = None
+                return ref
+            holders = wireless.interfering_daemons()
+            if holders:
+                raise ModuleError(
+                    f"{ref} is in {mode} mode and {', '.join(holders)} is holding "
+                    "the radio; switching it to monitor now would be fought and "
+                    "would drop your connection uncleanly. Free the radio first "
+                    f"('sudo systemctl stop {holders[0]}' or 'sudo airmon-ng check "
+                    "kill'), then try again."
+                )
+            wireless.set_mode(ref, "monitor")
+            self._monitor_undo = {"action": "revert", "iface": ref, "prev": mode}
+            # Re-typing changes the link layer scapy caches for this NIC.
+            scapy_io.refresh_interfaces()
+            return ref
+        iface = wireless.add_monitor(ref)
+        self._monitor_undo = {"action": "delete", "iface": iface, "phy": ref}
+        # A just-created interface is absent from scapy's import-time cache;
+        # without this refresh sniffing on it fails with ENODEV (No such device).
+        scapy_io.refresh_interfaces()
+        return iface
+
+    def _teardown_monitor(self, *, note: bool = True) -> None:
+        """Undo whatever :meth:`_ensure_monitor` changed; optionally record a note.
+
+        Best-effort: a teardown failure is logged and surfaced but never masks the
+        stop. ``note=False`` for the transient activity scan, which restores the
+        radio silently.
+        """
+        undo, self._monitor_undo = self._monitor_undo, None
+        if not undo:
+            return
+        try:
+            if undo["action"] == "revert":
+                wireless.set_mode(undo["iface"], undo["prev"])
+                message = f" {undo['iface']} restored to {undo['prev']} mode."
+            else:  # delete a VIF we created
+                wireless.del_interface(undo["iface"])
+                message = (
+                    f" Removed monitor interface {undo['iface']}; restart your "
+                    "connection manager to reconnect."
+                )
+        except Exception as exc:  # noqa: BLE001 - teardown must not mask the stop
+            message = f" WARNING: could not restore {undo['iface']} automatically: {exc}"
+            self._log.warning("Monitor teardown failed for %s: %s", undo.get("iface"), exc)
+        if note:
+            self._teardown_note = message
+
+    def pop_teardown_note(self) -> str:
+        """Return and clear the note describing the last monitor teardown, if any."""
+        note, self._teardown_note = self._teardown_note, ""
+        return note
+
+    def _monitor_notice(self) -> str:
+        """Connectivity warning shown when a live capture put the radio in monitor mode."""
+        undo = self._monitor_undo
+        if not undo:
+            return ""
+        if undo["action"] == "revert":
+            return (
+                f" NOTE: {undo['iface']} was switched to monitor mode and has no "
+                "network connectivity while capturing. Stop the capture ('wireless "
+                "capture stop') to switch it back to managed mode."
+            )
+        return (
+            f" NOTE: created monitor interface {undo['iface']} on {undo['phy']} "
+            "(it has no connectivity). Stop the capture ('wireless capture stop') "
+            "to remove it."
+        )
 
     @staticmethod
     def _parse_channels(spec: str) -> list[int]:

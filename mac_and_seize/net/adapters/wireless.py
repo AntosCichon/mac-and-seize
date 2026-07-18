@@ -137,6 +137,95 @@ def phy_siblings(name: str) -> list[tuple[str, str]]:
         return []
 
 
+#: Connection managers that, when running, keep a Wi-Fi card on its associated
+#: channel - the usual reason a monitor-mode sweep can't hop. ``airmon-ng check
+#: kill`` stops these (modern airmon-ng handles iwd too).
+_RADIO_HOLDERS = ("iwd", "NetworkManager", "wpa_supplicant")
+
+
+def interfering_daemons() -> list[str]:
+    """Names of running connection managers likely to be holding the Wi-Fi radio.
+
+    Complements :func:`phy_siblings`: that only spots *another interface* on the
+    same PHY, but the common case is a single interface (``wlan0``) whose radio
+    is held by a daemon with no sibling VIF to point at. Reads process names
+    from ``/proc``; best-effort, returns ``[]`` if it cannot be read.
+    """
+    found: list[str] = []
+    try:
+        for entry in os.scandir("/proc"):
+            if not entry.name.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry.name}/comm", encoding="ascii") as fh:
+                    comm = fh.read().strip()
+            except OSError:
+                continue
+            if comm in _RADIO_HOLDERS and comm not in found:
+                found.append(comm)
+    except OSError:
+        return []
+    return found
+
+
+# --- PHY (radio) topology --------------------------------------------------
+
+
+def list_phys() -> list[str]:
+    """Every 802.11 PHY (radio) present, by name (e.g. ``['phy0']``).
+
+    Reads sysfs, so it needs no privileges and, crucially, still lists a radio
+    whose netdev has been removed - the case after iwd (which owns interface
+    lifecycle by default) is stopped and ``wlan0`` disappears while ``phy0``
+    survives. That surviving PHY is what a monitor interface is created on.
+    """
+    try:
+        return sorted(os.listdir("/sys/class/ieee80211"))
+    except OSError:
+        return []
+
+
+def sole_phy() -> str | None:
+    """The only PHY present, or ``None`` if there are zero or several."""
+    phys = list_phys()
+    return phys[0] if len(phys) == 1 else None
+
+
+def phy_of(name: str) -> str | None:
+    """The PHY backing interface ``name`` (e.g. ``'phy0'``), or ``None``."""
+    try:
+        target = os.path.realpath(f"/sys/class/net/{name}/phy80211")
+    except OSError:
+        return None
+    base = os.path.basename(target)
+    return base if base.startswith("phy") else None
+
+
+def interfaces_on_phy(phy: str) -> list[tuple[str, str]]:
+    """``(dev, mode)`` for every netdev currently on ``phy``."""
+    result: list[tuple[str, str]] = []
+    try:
+        devs = sorted(os.listdir("/sys/class/net"))
+    except OSError:
+        return result
+    for dev in devs:
+        if phy_of(dev) != phy:
+            continue
+        try:
+            result.append((dev, current_mode(dev)))
+        except WirelessError:
+            result.append((dev, "?"))
+    return result
+
+
+def _phy_index(phy: str) -> int:
+    try:
+        with open(f"/sys/class/ieee80211/{phy}/index", encoding="ascii") as fh:
+            return int(fh.read().strip())
+    except OSError as exc:
+        raise WirelessError(f"No such wireless PHY {phy!r}.") from exc
+
+
 def current_mode(name: str) -> str:
     """Return the interface's 802.11 mode (e.g. ``'monitor'``, ``'managed'``)."""
     card = _card(name)
@@ -209,7 +298,7 @@ def set_channel(name: str, channel: int) -> None:
     if mode != "monitor":
         raise WirelessError(
             f"{name!r} is in {mode!r} mode; the channel can only be set in "
-            f"monitor mode. Run 'interface mode {name} monitor' first."
+            "monitor mode."
         )
     try:
         if not pyw.isup(card):
@@ -220,6 +309,66 @@ def set_channel(name: str, channel: int) -> None:
             f"Could not set {name!r} to channel {channel}: {exc} "
             "(the card may not support this channel)."
         ) from exc
+    # Verify the radio actually retuned. Some drivers accept the channel set in
+    # standalone monitor mode without moving the RF hardware - notably Realtek
+    # rtw88 (rtw88_8821ce/8822be/...), which stays parked on the last channel the
+    # firmware was really tuned to (usually the last associated channel). A sweep
+    # then silently only ever sees that one channel. Read it back and fail loud
+    # instead. If it can't be read we trust the set rather than false-fail.
+    try:
+        actual = pyw.chget(card)
+    except pyric.error:
+        actual = None
+    if actual is not None and actual != channel:
+        raise WirelessError(
+            f"{name!r} stayed on channel {actual} after being told to switch to "
+            f"{channel}. The driver likely cannot retune in monitor mode (common "
+            "on Realtek rtw88 radios), or a connection manager is holding the "
+            "radio - free it with 'sudo airmon-ng check kill' (and 'sudo "
+            "systemctl stop iwd' if iwd is running)."
+        )
     # Debug, not info: a channel sweep calls this several times a second, and at
     # info it would flood the interactive prompt (see modules/README.md 9).
     _log.debug("Set %s to channel %d", name, channel)
+
+
+def add_monitor(phy: str, name: str = "mon0") -> str:
+    """Create monitor-mode VIF ``name`` on ``phy``, bring it up; return ``name``.
+
+    Targets the PHY by index, so it works even when the PHY has no netdev - the
+    reliable path after a connection manager that owns interface lifecycle (iwd)
+    has been stopped and its ``wlan0`` is gone. If the PHY is busy because a
+    manager still holds it, this fails with a hint; per the tool's instruct-only
+    stance it deliberately does **not** stop that daemon itself. Requires root.
+    """
+    name = name.strip()
+    if not name:
+        raise ValueError("Specify a name for the monitor interface.")
+    if os.path.exists(f"/sys/class/net/{name}"):
+        raise WirelessError(f"An interface named {name!r} already exists.")
+    index = _phy_index(phy)
+    try:
+        card = pyw.phyadd(index, name, "monitor")
+        pyw.up(card)
+    except pyric.error as exc:
+        holders = interfering_daemons()
+        hint = (
+            f" A connection manager ({', '.join(holders)}) is holding this radio; "
+            "free it first ('sudo systemctl stop iwd' or 'sudo airmon-ng check "
+            "kill') and retry."
+        ) if holders else ""
+        raise WirelessError(
+            f"Could not create monitor interface {name!r} on {phy}: {exc}.{hint}"
+        ) from exc
+    _log.info("Created monitor interface %s on %s", name, phy)
+    return name
+
+
+def del_interface(name: str) -> None:
+    """Delete a (virtual) wireless interface, e.g. one from :func:`add_monitor`."""
+    card = _card(name)
+    try:
+        pyw.devdel(card)
+    except pyric.error as exc:
+        raise WirelessError(f"Could not delete interface {name!r}: {exc}") from exc
+    _log.info("Deleted wireless interface %s", name)
