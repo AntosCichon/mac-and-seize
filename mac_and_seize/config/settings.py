@@ -46,6 +46,9 @@ class LoggingConfig(BaseModel):
         default_factory=lambda: datetime.now().strftime("%Y-%m-%d_%H-%M-%S.log")
     )
     remove_on_exit: bool = True
+    # When False (default), log records are written only to the file; the live
+    # session/terminal stays quiet. Set True to also stream them to the console.
+    terminal: bool = False
 
 
 class SetupConfig(BaseModel):

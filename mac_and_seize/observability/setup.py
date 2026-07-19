@@ -44,16 +44,21 @@ def configure_logging(config: AppConfig) -> logging.Logger:
     logger.setLevel(level)
     logger.propagate = False
 
-    console = logging.StreamHandler(stream=sys.stderr)
-    console.set_name("console")  # so the interactive front-end can find/replace it
-    console.setFormatter(
-        ColorFormatter(
-            "%(asctime)s [%(levelname)s] %(message)s",
-            datefmt="%H:%M:%S",
-            use_color=sys.stderr.isatty(),
+    # The console handler streams records to the live session. It is opt-in
+    # (logging.terminal): when disabled, records go to the file only and the
+    # interactive prompt stays quiet (the front-end finds no "console" handler
+    # to swap, so nothing is printed above the prompt either).
+    if config.logging.terminal:
+        console = logging.StreamHandler(stream=sys.stderr)
+        console.set_name("console")  # so the interactive front-end can find/replace it
+        console.setFormatter(
+            ColorFormatter(
+                "%(asctime)s [%(levelname)s] %(message)s",
+                datefmt="%H:%M:%S",
+                use_color=sys.stderr.isatty(),
+            )
         )
-    )
-    logger.addHandler(console)
+        logger.addHandler(console)
 
     log_dir = Path(config.logging.directory)
     log_dir.mkdir(parents=True, exist_ok=True)

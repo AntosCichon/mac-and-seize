@@ -10,7 +10,9 @@ listen_address = "127.0.0.1"
 level = "DEBUG"
 directory = "logs"
 # filename = "custom.log"   # defaults to a timestamped name
-remove_on_exit = true
+remove_on_exit = false
+# Stream log records to the live session too; when false, logs go to file only.
+terminal = false
 
 [setup]
 export_directory = "exports"
