@@ -1,10 +1,12 @@
-"""Discovery module: find live hosts on the network.
+"""Discovery module: find live hosts and their open ports on the network.
 
 Auto-discovered via :func:`register`. Registers one session-scoped service
-(``"discovery"``) and the ``discovery`` command group: ``host``
-(scan/cancel/import/list/clear/summary - scapy ARP sweeps, plus identifying
-active hosts from an imported pcap) and a ``service`` stub for future
-port/service discovery.
+(``"discovery"``) that keeps a single, host-oriented store, and the flat
+``discovery`` command group: ``scan`` (scapy ARP host sweep), ``tcp``/``udp``
+(background TCP SYN / UDP port scans that attach open ports to their host, with a
+``discovered`` target that scans every host found so far), ``import`` (identify
+active hosts from a pcap), ``inspect`` (interactive host/ports table), and
+``list``/``clear``/``summary``/``cancel``.
 """
 
 from __future__ import annotations

@@ -18,7 +18,7 @@ The probe is a pure-scapy ARP sweep inspired by nmap's ``-PR`` host discovery;
 none of nmap's code is used.
 
 scapy's ``srp`` blocks until its timeout with no cooperative interrupt point, so
-a running probe cannot be stopped mid-flight. ``cancel_scan`` is
+a running probe cannot be stopped mid-flight. :meth:`cancel` is
 therefore *instant by detachment* (see ``modules/README.md`` §9): each scan is a
 :class:`_Run` with its own identity, and cancelling drops its task from
 ``tasks``, clears it as the current run, and marks it cancelled - so a new scan
@@ -31,7 +31,16 @@ Hosts can also be identified *without probing* by importing a pcap (e.g. one a
 ``capture export`` produced): :meth:`import_hosts` records every sender it sees
 as up. See :func:`_active_hosts_from_packets`.
 
-Service (port/version) discovery is a stub for now - see :meth:`scan_services`.
+There is a **single, host-oriented store** (``self._hosts``): host discovery,
+pcap import, and service discovery all write into it. Service discovery -
+:meth:`start_service_scan`, a background TCP SYN or UDP port scan - does not keep
+its own list; each open port it finds is attached to its host as a
+:class:`~mac_and_seize.modules.discovery.host.Port` (``Host.ports``), and a scan
+that finds an open port on a not-yet-known IP creates that host (``method`` =
+``"port"``). It reuses the store for the ``"discovered"`` target - scanning every
+host found so far - and runs in its own background thread with the same
+detach-on-cancel model as a host scan, tracked independently so a host scan and a
+port scan can run at the same time (:meth:`cancel` stops whichever are running).
 """
 
 from __future__ import annotations
@@ -40,12 +49,13 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeGuard
 
 from mac_and_seize.core.errors import ModuleError
-from mac_and_seize.modules.discovery.host import Host, aggregate_rows
+from mac_and_seize.modules.discovery.host import Host, Port, _ip_sort_key, host_rows
 from mac_and_seize.net.adapters import netifaces_io, scapy_io
 from mac_and_seize.observability import get_logger
+from mac_and_seize.util.parse import split_values
 
 if TYPE_CHECKING:
     from mac_and_seize.core.context import AppContext
@@ -61,6 +71,22 @@ _DEFAULT_TIMEOUT = 0.5
 
 #: Source addresses that identify no real host (never treated as active).
 _NON_HOST_SOURCES = {"0.0.0.0", "::"}
+
+#: Default seconds to wait for replies in a service (port) scan. Longer than the
+#: ARP default because these probes are routed (higher RTT), and a filtered port
+#: never answers so the scan always waits the full timeout per host - keep it
+#: modest so a many-host scan does not crawl. The user can override with
+#: ``--timeout`` (lower on a fast LAN, higher across a slow WAN).
+_DEFAULT_SERVICE_TIMEOUT = 2.0
+
+#: Default port spec when ``--port`` is omitted (the well-known + registered
+#: range most services live in).
+_DEFAULT_PORTS = "1-1000"
+
+#: Upper bound on total probes (hosts x ports) a single service scan may send,
+#: so an accidental huge sweep (a wide range across many hosts) is rejected up
+#: front instead of flooding the network. A /24 at the default 1000 ports fits.
+_MAX_PROBES = 262_144
 
 
 def _active_hosts_from_packets(packets: list) -> dict[str, str | None]:
@@ -114,6 +140,15 @@ class _Run:
     cancelled: bool = False
 
 
+def _alive(run: _Run | None) -> TypeGuard[_Run]:
+    """True if ``run`` exists and its worker thread is still running.
+
+    A :class:`~typing.TypeGuard` so a caller that guards on it may then touch
+    ``run``'s fields without a separate ``None`` check.
+    """
+    return run is not None and run.thread is not None and run.thread.is_alive()
+
+
 class DiscoveryService:
     """Background scapy host discovery with a per-session store of hosts found.
 
@@ -124,17 +159,22 @@ class DiscoveryService:
     def __init__(self) -> None:
         self._log = get_logger(__name__)
         self._lock = threading.RLock()
+        #: The single, host-oriented store: one Host per IP, each carrying its
+        #: own open ports. Host discovery, pcap import, and port scans all merge
+        #: into this.
         self._hosts: dict[str, Host] = {}
-        #: The current (foreground) scan, or ``None``. Cancelling detaches it by
+        #: The current host-discovery scan, or ``None``. Cancelling detaches it by
         #: setting this back to ``None`` even while its thread is still draining.
         self._run: _Run | None = None
+        #: The current port scan, tracked separately from ``_run`` so a host scan
+        #: and a port scan can run at the same time.
+        self._svc_run: _Run | None = None
 
     # --- Background scan -------------------------------------------------------
 
     def is_scanning(self) -> bool:
         with self._lock:
-            run = self._run
-            return run is not None and run.thread is not None and run.thread.is_alive()
+            return _alive(self._run)
 
     def start_scan(
         self,
@@ -162,7 +202,7 @@ class DiscoveryService:
             run = _Run(
                 target=target,
                 iface=iface,
-                task=context.tasks.start(context.current_command, stop=self.cancel_scan),
+                task=context.tasks.start(context.current_command, stop=self.cancel),
                 context=context,
             )
             run.thread = threading.Thread(
@@ -204,27 +244,40 @@ class DiscoveryService:
             return target, list(dict.fromkeys(hosts))  # dedup, keep order
         return None, scapy_io.expand_hosts(target)
 
-    def cancel_scan(self) -> str:
-        """Cancel the running scan at once and let a new one start immediately.
+    def cancel(self) -> str:
+        """Cancel whichever discovery scans are running (host and/or port).
 
-        The in-flight scapy probe can't be interrupted - ``sr``/``srp`` have no
-        cooperative stop hook - so instead of waiting for it we *detach* the run:
-        clear it as the current scan, mark it cancelled, and drop its task. A new
-        scan can start right away; the abandoned probe drains on its own daemon
-        thread and discards its results. See ``modules/README.md`` §9.
+        A host scan and a port scan run in independent slots, so this stops
+        both if both are in flight. Cancelling is *instant by detachment*: the
+        in-flight scapy probe can't be interrupted (``sr``/``srp`` have no
+        cooperative stop hook), so rather than wait for it we clear the run as
+        current, mark it cancelled, and drop its task - a new scan can start at
+        once, and the abandoned probe drains on its own daemon thread and
+        discards its results. See ``modules/README.md`` §9.
         """
+        cancelled: list[_Run] = []
+        labels: list[str] = []
         with self._lock:
-            run = self._run
-            if run is None or run.thread is None or not run.thread.is_alive():
-                raise ModuleError("No scan is currently running.")
-            run.cancelled = True
-            self._run = None  # detach now, so start_scan is free again
-        run.context.tasks.finish(run.task)
-        self._log.info("Discovery scan cancelled (target=%s)", run.target)
+            host_run = self._run
+            if _alive(host_run):
+                host_run.cancelled = True
+                self._run = None  # detach now, so start_scan is free again
+                cancelled.append(host_run)
+                labels.append("host scan")
+            svc_run = self._svc_run
+            if _alive(svc_run):
+                svc_run.cancelled = True
+                self._svc_run = None  # detach now, so start_service_scan is free again
+                cancelled.append(svc_run)
+                labels.append("port scan")
+        if not cancelled:
+            raise ModuleError("No scan is currently running.")
+        for run in cancelled:
+            run.context.tasks.finish(run.task)
+        self._log.info("Discovery cancelled: %s", ", ".join(labels))
         return (
-            "Scan cancelled (the abandoned "
-            "probe finishes on its own in the background, but the results will be "
-            "discarded)."
+            f"Cancelled {' and '.join(labels)} (the abandoned probe(s) finish on "
+            "their own in the background, but the results will be discarded)."
         )
 
     def _run_scan(
@@ -282,10 +335,16 @@ class DiscoveryService:
         )
 
     def _merge_locked(self, replies: dict[str, tuple[str | None, str]]) -> int:
-        """Merge a completed sweep's replies into the store. Caller holds ``_lock``."""
+        """Merge a completed sweep's replies into the store. Caller holds ``_lock``.
+
+        Preserves an already-known host's open ports (and doesn't wipe a known
+        MAC with a reply that carries none), since host discovery and port scans
+        share the one store.
+        """
         now = datetime.now(timezone.utc)
         for ip, (mac, method) in replies.items():
             existing = self._hosts.get(ip)
+            mac = mac or (existing.mac if existing else None)
             self._hosts[ip] = Host(
                 ip=ip,
                 mac=mac,
@@ -294,6 +353,7 @@ class DiscoveryService:
                 method=method,
                 first_seen=existing.first_seen if existing else now,
                 last_seen=now,
+                ports=existing.ports if existing else {},
             )
         return len(replies)
 
@@ -344,36 +404,302 @@ class DiscoveryService:
             self._log.info("Cleared %d discovered host(s)", count)
             return count
 
-    def list_hosts(self) -> list[dict]:
+    def list_rows(self) -> list[dict]:
+        """Rows for ``discovery list``: ip, mac, and open ports (no vendor)."""
         with self._lock:
-            return aggregate_rows(self._hosts.values())
+            return [
+                {"ip": row["ip"], "mac": row["mac"], "ports": row["ports"]}
+                for row in host_rows(self._hosts.values())
+            ]
+
+    def inspect_rows(self) -> list[dict]:
+        """Rows for ``discovery inspect``: ip, mac, vendor, and open ports."""
+        with self._lock:
+            return host_rows(self._hosts.values())
 
     def summary(self) -> dict:
         with self._lock:
             hosts = list(self._hosts.values())
             scanning = self.is_scanning()
+            port_scanning = self.is_service_scanning()
         methods: dict[str, int] = {}
+        open_ports = 0
+        hosts_with_ports = 0
         for host in hosts:
             methods[host.method] = methods.get(host.method, 0) + 1
-        # Logical = unique IP addresses (one per stored host); physical = unique
-        # MAC addresses. A host with several IPs on one NIC is many logical
-        # addresses but a single physical one (which is why 'list' can show fewer
-        # rows than the logical count).
-        logical = len(hosts)
-        physical = len({host.mac for host in hosts if host.mac})
+            if host.ports:
+                hosts_with_ports += 1
+                open_ports += len(host.ports)
         return {
-            "logical_addresses": logical,
-            "physical_hosts": physical,
+            "hosts": len(hosts),
             "with_mac": sum(1 for host in hosts if host.mac),
             "with_vendor": sum(1 for host in hosts if host.vendor),
-            "by_method": ", ".join(f"{k}={v}" for k, v in sorted(methods.items())),
+            "unique_macs": len({host.mac for host in hosts if host.mac}),
+            "open_ports": open_ports,
+            "hosts_with_open_ports": hosts_with_ports,
+            "by_method": ", ".join(f"{k}={v}" for k, v in sorted(methods.items())) or "-",
             "scanning": scanning,
+            "port_scanning": port_scanning,
         }
 
-    # --- Service discovery (stub) -------------------------------------------------
+    # --- Service (port) discovery -------------------------------------------------
 
-    def scan_services(self, ip: str) -> None:
-        raise ModuleError(
-            "Service discovery is not implemented yet; host discovery is "
-            "available via 'discovery host scan'."
+    def is_service_scanning(self) -> bool:
+        with self._lock:
+            return _alive(self._svc_run)
+
+    def start_service_scan(
+        self,
+        context: "AppContext",
+        target: str,
+        proto: str,
+        *,
+        port: str | None = None,
+        timeout: float | None = None,
+    ) -> str:
+        """Start a background ``proto`` (``"tcp"``/``"udp"``) port scan of ``target``.
+
+        ``target`` accepts the same forms as a host scan (IP, CIDR, last-octet
+        range, hostname, or a local interface name) plus the keyword
+        ``"discovered"``, which scans every host found by host discovery so far.
+        ``port`` is a single port, a comma list, or an ``a-b`` range (default
+        :data:`_DEFAULT_PORTS`). Only open results are stored - see
+        :meth:`_run_service_scan`.
+        """
+        target = target.strip()
+        if not target:
+            raise ValueError("A scan target is required (e.g. an IP, range, or 'discovered').")
+        proto = proto.lower()
+        if proto not in ("tcp", "udp"):
+            raise ValueError(f"Unknown protocol {proto!r}; expected 'tcp' or 'udp'.")
+        if timeout is not None and timeout <= 0:
+            raise ValueError("--timeout must be a positive number of seconds.")
+        wait = timeout or _DEFAULT_SERVICE_TIMEOUT
+        ports = self._parse_ports(port or _DEFAULT_PORTS)
+        # Resolve up front (synchronously) so a bad target / empty 'discovered'
+        # store / oversized scan fails now, before a background task is registered.
+        iface, hosts = self._resolve_service_target(target)
+        if not hosts:
+            raise ValueError(f"Target {target!r} expands to no hosts to scan.")
+        total = len(hosts) * len(ports)
+        if total > _MAX_PROBES:
+            raise ValueError(
+                f"That scan is {total} probes ({len(hosts)} host(s) x {len(ports)} "
+                f"port(s)); the limit is {_MAX_PROBES}. Narrow --port or the target."
+            )
+
+        with self._lock:
+            if self.is_service_scanning():
+                raise ModuleError(
+                    "A port scan is already running. Cancel it before starting another."
+                )
+            run = _Run(
+                target=target,
+                iface=iface,
+                task=context.tasks.start(context.current_command, stop=self.cancel),
+                context=context,
+            )
+            run.thread = threading.Thread(
+                target=self._run_service_scan,
+                args=(run, hosts, ports, proto, wait),
+                daemon=True,
+            )
+            self._svc_run = run
+            run.thread.start()
+        self._log.info(
+            "Port scan started (proto=%s, target=%s, iface=%s, hosts=%d, ports=%d)",
+            proto, target, iface or "default", len(hosts), len(ports),
         )
+        return (
+            f"{proto.upper()} port scan started in the background for {target} "
+            f"({len(hosts)} host(s) x {len(ports)} port(s))."
+        )
+
+    def _resolve_service_target(self, target: str) -> tuple[str | None, list[str]]:
+        """Resolve a service-scan ``target`` to ``(iface, hosts)``.
+
+        Adds the ``"discovered"`` keyword to the host-scan target forms: it scans
+        every IP found by host discovery so far (routed, so ``iface`` is
+        ``None``). Everything else defers to :meth:`_resolve_target`.
+        """
+        if target.lower() == "discovered":
+            with self._lock:
+                hosts = sorted({host.ip for host in self._hosts.values()}, key=_ip_sort_key)
+            if not hosts:
+                raise ModuleError(
+                    "No hosts discovered yet to scan; run 'discovery scan' first "
+                    "(or give an explicit target)."
+                )
+            return None, hosts
+        return self._resolve_target(target)
+
+    @staticmethod
+    def _parse_ports(spec: str) -> list[int]:
+        """Parse a ``--port`` spec into a deduped list of port numbers.
+
+        Accepts a single port, a comma list (``22,80,443``), or an inclusive
+        range (``1-1000``); mixtures work too (``22,80,8000-8100``). Raises
+        :class:`ValueError` for a non-numeric or out-of-range (1-65535) port.
+        """
+        ports: list[int] = []
+        for value in split_values(spec):
+            if not value.isdigit():
+                raise ValueError(
+                    f"Invalid port {value!r}; expected a number, list (a,b,c), or "
+                    "range (a-b)."
+                )
+            number = int(value)
+            if not 1 <= number <= 65535:
+                raise ValueError(f"Port {number} is out of range (1-65535).")
+            ports.append(number)
+        ports = list(dict.fromkeys(ports))  # dedup, keep order
+        if not ports:
+            raise ValueError("No ports to scan.")
+        return ports
+
+    def _run_service_scan(
+        self,
+        run: _Run,
+        hosts: list[str],
+        ports: list[int],
+        proto: str,
+        timeout: float,
+    ) -> None:
+        target = run.target
+        # (ip, proto, port) -> state, for the open results worth storing.
+        found: dict[tuple[str, str, int], str] = {}
+        error: Exception | None = None
+        try:
+            for host in hosts:
+                if run.cancelled:  # cancel takes effect between hosts
+                    break
+                try:
+                    # No iface pin: an L3 SYN/UDP scan is routed, so the kernel
+                    # picks the egress interface for each destination (an
+                    # interface target already narrowed `hosts` to that NIC's
+                    # subnet, which routes back out through it).
+                    if proto == "tcp":
+                        states = scapy_io.tcp_syn_scan(host, ports, timeout=timeout)
+                    else:
+                        states = scapy_io.udp_scan(host, ports, timeout=timeout)
+                except PermissionError:
+                    raise  # missing root affects every host - abort the whole scan
+                except OSError as exc:
+                    # A per-host failure (e.g. no route) must not kill the scan.
+                    self._log.warning("Service scan of host %s failed: %s", host, exc)
+                    continue
+                self._collect(found, host, proto, ports, states)
+        except PermissionError as exc:
+            error = ModuleError(
+                "Port scanning needs raw-socket access; relaunch as root (sudo)."
+            )
+            self._log.info("Service scan denied (not root): %s", exc)
+        except Exception as exc:  # noqa: BLE001 - report, never crash the worker thread
+            error = exc
+
+        # Read cancelled and merge under one lock acquisition (see _run_scan): a
+        # cancel can only detach this run, so `not cancelled` means we are still
+        # current and it is safe to commit.
+        open_count = 0
+        filtered_count = 0
+        with self._lock:
+            cancelled = run.cancelled
+            if self._svc_run is run:
+                self._svc_run = None
+            if not cancelled and error is None:
+                open_count, filtered_count = self._merge_ports_locked(found)
+
+        run.context.tasks.finish(run.task)  # idempotent; cancel may already have
+
+        if cancelled:
+            self._log.info("Discarded result of cancelled port scan (target=%s)", target)
+            return
+        if error is not None:
+            self._log.warning("Port scan failed (target=%s): %s", target, error)
+            run.context.presenter.notify(f"Port scan of {target} failed: {error}")
+            return
+        counts = [f"{open_count} open"]
+        if filtered_count:
+            counts.append(f"{filtered_count} open|filtered")
+        run.context.presenter.notify(
+            f"{proto.upper()} port scan of {target} finished: "
+            f"{', '.join(counts)} port(s) found."
+        )
+
+    @staticmethod
+    def _collect(
+        found: dict[tuple[str, str, int], str],
+        host: str,
+        proto: str,
+        ports: list[int],
+        states: dict[int, str],
+    ) -> None:
+        """Record the *interesting* results from one host's scan into ``found``.
+
+        For TCP, only the ports the probe reported ``"open"``. For UDP, ``"open"``
+        ports plus any that never answered (recorded ``open|filtered`` - UDP
+        silence is ambiguous); closed and filtered ports are dropped. Whether an
+        ``open|filtered`` result is actually persisted is decided per host by
+        :meth:`_merge_ports_locked`, which never fabricates a host from silence.
+        """
+        if proto == "tcp":
+            for port, state in states.items():
+                if state == "open":
+                    found[(host, "tcp", port)] = "open"
+            return
+        for port in ports:
+            state = states.get(port)
+            if state == "open":
+                found[(host, "udp", port)] = "open"
+            elif state is None:  # no reply - open or filtered, can't tell apart
+                found[(host, "udp", port)] = "open|filtered"
+
+    def _merge_ports_locked(
+        self, found: dict[tuple[str, str, int], str]
+    ) -> tuple[int, int]:
+        """Attach found ports to their hosts in the store. Caller holds ``_lock``.
+
+        A genuine ``"open"`` port (a real reply) is proof the host is live, so it
+        may create a host not yet in the store (state ``"up"``, ``method`` =
+        ``"port"``). A UDP ``"open|filtered"`` port is only the *absence* of a
+        reply, so on its own it is no proof of a host: it is attached only to a
+        host already known live - one already in the store, or one this same scan
+        proved live with a genuine open port - and is dropped for an
+        otherwise-unknown IP, so a silent or unused address is never fabricated as
+        a live host. An existing host keeps its identity (MAC/vendor/method); only
+        its ports and ``last_seen`` are updated. Returns ``(open, open_filtered)``
+        - the counts of ports actually persisted.
+        """
+        now = datetime.now(timezone.utc)
+        # Decide liveness once, up front: an IP already stored, or one with a
+        # genuine open reply anywhere in this scan. Computing it before the merge
+        # keeps it order-independent - a later open still rescues the same host's
+        # earlier open|filtered ports.
+        live_ips = set(self._hosts)
+        live_ips |= {ip for (ip, _p, _n), state in found.items() if state == "open"}
+        open_count = 0
+        filtered_count = 0
+        for (ip, proto, port), state in found.items():
+            if ip not in live_ips:
+                continue  # only open|filtered on an unknown IP - no proof of a host
+            host = self._hosts.get(ip)
+            if host is None:
+                host = Host(
+                    ip=ip, mac=None, vendor=None, state="up", method="port",
+                    first_seen=now, last_seen=now,
+                )
+                self._hosts[ip] = host
+            existing = host.ports.get((proto, port))
+            host.ports[(proto, port)] = Port(
+                proto=proto,
+                port=port,
+                state=state,
+                first_seen=existing.first_seen if existing else now,
+                last_seen=now,
+            )
+            host.last_seen = now
+            if state == "open":
+                open_count += 1
+            else:
+                filtered_count += 1
+        return open_count, filtered_count

@@ -12,7 +12,19 @@ import ipaddress
 import logging
 import re
 
-from scapy.all import ARP, Ether, conf, get_if_list, sniff as _sniff, srp
+from scapy.all import (
+    ARP,
+    ICMP,
+    IP,
+    TCP,
+    UDP,
+    Ether,
+    conf,
+    get_if_list,
+    sniff as _sniff,
+    sr,
+    srp,
+)
 from scapy.utils import rdpcap, wrpcap
 
 from mac_and_seize.net.model.packet import Packet
@@ -150,6 +162,94 @@ def mac_vendor(mac: str | None) -> str | None:
     if normalized_mac.startswith(normalized_vendor):
         return None  # scapy returned the address itself, not a vendor name
     return vendor
+
+
+# TCP header flag bits (RFC 793) used to classify a SYN-scan reply.
+_TCP_SYN = 0x02
+_TCP_RST = 0x04
+_TCP_ACK = 0x10
+_TCP_SYN_ACK = _TCP_SYN | _TCP_ACK
+
+# ICMP "destination unreachable" (type 3) codes. Port-unreachable means a UDP
+# port is closed; the admin/host/net-prohibited codes mean a firewall dropped
+# the probe (filtered) rather than the port being closed.
+_ICMP_UNREACHABLE = 3
+_ICMP_PORT_UNREACHABLE = 3
+_ICMP_FILTERED_CODES = {1, 2, 9, 10, 13}
+
+
+def tcp_syn_scan(
+    host: str, ports: list[int], *, timeout: float = 2.0
+) -> dict[int, str]:
+    """TCP SYN-scan one ``host`` across ``ports``; return ``{port: state}``.
+
+    Sends a lone SYN to each port (a half-open scan - the handshake is never
+    completed) and classifies the reply: a SYN/ACK means the port is ``"open"``,
+    a RST means ``"closed"``, and an ICMP unreachable means ``"filtered"``. Ports
+    that never answer are *absent* from the result (the caller treats silence as
+    filtered). Unlike an ARP sweep this runs at layer 3, so it is *routed*: the
+    egress interface is chosen by the routing table (there is no ``iface`` pin -
+    scapy's L3 ``sr`` ignores it), and it can reach hosts beyond the local link.
+    Mirrors nmap's ``-sS`` SYN scan; the implementation is an original scapy
+    composition. Needs raw-socket access.
+    """
+    if not ports:
+        return {}
+    answered, _ = sr(
+        IP(dst=host) / TCP(dport=ports, flags="S"),
+        timeout=timeout,
+        verbose=False,
+    )
+    states: dict[int, str] = {}
+    for sent, received in answered:
+        dport = int(sent[TCP].dport)
+        if received.haslayer(TCP):
+            flags = int(received[TCP].flags)
+            if (flags & _TCP_SYN_ACK) == _TCP_SYN_ACK:
+                states[dport] = "open"
+            elif flags & _TCP_RST:
+                states[dport] = "closed"
+        elif received.haslayer(ICMP) and int(received[ICMP].type) == _ICMP_UNREACHABLE:
+            states[dport] = "filtered"
+    return states
+
+
+def udp_scan(
+    host: str, ports: list[int], *, timeout: float = 2.0
+) -> dict[int, str]:
+    """UDP-scan one ``host`` across ``ports``; return ``{port: state}``.
+
+    Sends an empty UDP datagram to each port and classifies the reply: a UDP
+    response means ``"open"``; an ICMP port-unreachable (type 3, code 3) means
+    ``"closed"``; another ICMP unreachable (admin/host/net-prohibited) means
+    ``"filtered"``. Ports that never answer are *absent* - UDP silence is
+    ambiguous (open or filtered), so the caller records those as
+    ``open|filtered``. Note that the kernel rate-limits outgoing ICMP errors, so
+    scanning many closed ports quickly can leave some looking unanswered. Runs at
+    layer 3 (routed, egress chosen by the routing table) and needs raw-socket
+    access.
+    """
+    if not ports:
+        return {}
+    answered, _ = sr(
+        IP(dst=host) / UDP(dport=ports),
+        timeout=timeout,
+        verbose=False,
+    )
+    states: dict[int, str] = {}
+    for sent, received in answered:
+        dport = int(sent[UDP].dport)
+        if received.haslayer(UDP):
+            states[dport] = "open"
+        elif received.haslayer(ICMP):
+            icmp = received[ICMP]
+            if int(icmp.type) == _ICMP_UNREACHABLE:
+                code = int(icmp.code)
+                if code == _ICMP_PORT_UNREACHABLE:
+                    states[dport] = "closed"
+                elif code in _ICMP_FILTERED_CODES:
+                    states[dport] = "filtered"
+    return states
 
 
 def send(iface_name: str, packet: Packet, *, timeout: int = 5):
