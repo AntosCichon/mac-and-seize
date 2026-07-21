@@ -252,10 +252,12 @@ def udp_scan(
     return states
 
 
-def send(iface_name: str, packet: Packet, *, timeout: int = 5):
+def send(iface_name: str | None, packet: Packet, *, timeout: int = 5):
     """Send a packet and wait for a response at layer 2 (scapy ``srp``).
 
-    Returns scapy's ``(answered, unanswered)`` pair.
+    ``iface_name`` pins the send to a specific NIC; pass ``None`` to let scapy
+    choose the default egress interface from its routing table. Returns scapy's
+    ``(answered, unanswered)`` pair.
     """
     pkt = packet.build() if isinstance(packet, Packet) else packet
     return srp(pkt, iface=iface_name, threaded=False, timeout=timeout, verbose=False)

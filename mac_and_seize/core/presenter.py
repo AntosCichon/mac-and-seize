@@ -38,11 +38,68 @@ class Column:
     flex: bool = False
 
 
+@dataclass(frozen=True)
+class LayerField:
+    """One editable field of a :class:`LayerType` in the packet builder.
+
+    ``type`` is ``str`` or ``int`` and tells the front-end/module how to convert
+    the entered text; ``default`` pre-fills the field (empty means "leave to the
+    protocol default"). ``help`` is a one-line hint shown beside the field.
+    """
+
+    key: str
+    label: str
+    default: str = ""
+    help: str = ""
+    type: type = str
+
+
+@dataclass(frozen=True)
+class LayerType:
+    """A protocol layer offered by the interactive packet builder.
+
+    ``name`` is the layer's short name (e.g. ``"IP"``); ``fields`` are the
+    editable fields the builder exposes for it.
+    """
+
+    name: str
+    fields: list[LayerField]
+
+
+@dataclass
+class BuiltLayer:
+    """One layer the user added in the builder: a layer name and field values.
+
+    ``values`` maps each :class:`LayerField` key to the text the user entered
+    (an empty string means the field was left at its protocol default).
+    """
+
+    name: str
+    values: dict[str, str]
+
+
 class Presenter(Protocol):
     """A front-end's interactive-rendering capability."""
 
     def table(self, rows: list[dict], columns: list[Column], *, title: str) -> None:
         """Display ``rows`` as an interactive, scrollable table."""
+        ...
+
+    def build_packet(
+        self,
+        catalog: list[LayerType],
+        initial: list[BuiltLayer],
+        *,
+        title: str,
+    ) -> list[BuiltLayer] | None:
+        """Open an interactive packet builder and return the layers built.
+
+        ``catalog`` lists the layer types the user may add and the fields each
+        exposes; ``initial`` seeds the builder with pre-added layers (empty for
+        a blank craft, or a preset's layers). Returns the ordered
+        :class:`BuiltLayer` list the user assembled, or ``None`` if they
+        cancelled without saving.
+        """
         ...
 
     def notify(self, message: str) -> None:
@@ -65,6 +122,15 @@ class NullPresenter:
     """
 
     def table(self, rows: list[dict], columns: list[Column], *, title: str) -> None:
+        raise ModuleError("Interactive views are not available in this front-end.")
+
+    def build_packet(
+        self,
+        catalog: list[LayerType],
+        initial: list[BuiltLayer],
+        *,
+        title: str,
+    ) -> list[BuiltLayer] | None:
         raise ModuleError("Interactive views are not available in this front-end.")
 
     def notify(self, message: str) -> None:

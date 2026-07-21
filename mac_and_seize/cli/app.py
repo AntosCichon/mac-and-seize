@@ -23,7 +23,7 @@ from mac_and_seize.cli.tui import CursesPresenter
 from mac_and_seize.config import load_config
 from mac_and_seize.core.context import AppContext
 from mac_and_seize.observability import configure_logging, get_logger
-from mac_and_seize.util.static import COLORS, WELCOME_ART
+from mac_and_seize.util.static import COLORS, WELCOME_ART, WELCOME_IMAGE
 
 app = typer.Typer(
     name="mac-and-seize",
@@ -81,7 +81,8 @@ def main(
     ctx.obj.presenter = CursesPresenter()
 
     if sys.stderr.isatty():
-        typer.echo(f"{COLORS['yellow']}{WELCOME_ART}{COLORS['reset']}", err=True)
+        typer.echo(f"{WELCOME_IMAGE}", err=True)
+        typer.echo(f"{WELCOME_ART}", err=True)
 
     get_logger("mac_and_seize.cli").info("Application started")
 

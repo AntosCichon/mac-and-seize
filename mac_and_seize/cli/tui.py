@@ -23,7 +23,7 @@ import sys
 import threading
 from typing import Callable
 
-from mac_and_seize.core.presenter import Column
+from mac_and_seize.core.presenter import BuiltLayer, Column, LayerType
 from mac_and_seize.core.errors import ModuleError
 from mac_and_seize.util.static import COLORS
 
@@ -66,6 +66,28 @@ class CursesPresenter:
                 self._viewer_active = False
                 deferred, self._deferred = self._deferred, []
             # The viewer has restored the terminal; emit anything that arrived
+            # while it was open, before the REPL redraws its next prompt.
+            for line in deferred:
+                sys.stdout.write(line + "\n")
+            if deferred:
+                sys.stdout.flush()
+
+    def build_packet(
+        self,
+        catalog: list[LayerType],
+        initial: list[BuiltLayer],
+        *,
+        title: str,
+    ) -> list[BuiltLayer] | None:
+        with self._lock:
+            self._viewer_active = True
+        try:
+            return run_packet_builder(catalog, initial, title=title)
+        finally:
+            with self._lock:
+                self._viewer_active = False
+                deferred, self._deferred = self._deferred, []
+            # The builder has restored the terminal; emit anything that arrived
             # while it was open, before the REPL redraws its next prompt.
             for line in deferred:
                 sys.stdout.write(line + "\n")
@@ -249,3 +271,216 @@ def _loop(stdscr, rows: list[dict], columns: list[Column], title: str) -> None:
             selected = 0
         elif key == curses.KEY_END:
             selected = len(rows) - 1
+
+
+# --- Interactive packet builder ------------------------------------------------
+
+_ENTER_KEYS = {ord("\n"), ord("\r"), curses.KEY_ENTER}
+_BACKSPACE_KEYS = {curses.KEY_BACKSPACE, 127, 8}
+
+
+def run_packet_builder(
+    catalog: list[LayerType], initial: list[BuiltLayer], *, title: str = ""
+) -> list[BuiltLayer] | None:
+    """Open the interactive packet builder (needs a real terminal).
+
+    Returns the ordered layers the user assembled, or ``None`` if they
+    cancelled. See :class:`_PacketBuilder` for the navigation.
+    """
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise ModuleError("The interactive packet builder needs an interactive terminal.")
+    return curses.wrapper(
+        lambda stdscr: _PacketBuilder(stdscr, catalog, initial, title).run()
+    )
+
+
+class _PacketBuilder:
+    """A small vi-like curses form for stacking and editing packet layers.
+
+    Three nested views over a mutable list of :class:`BuiltLayer`:
+
+    * **layer list** - ``Up/Down`` select, ``a`` add a layer (opens the catalog
+      picker), ``d`` delete, ``[`` / ``]`` reorder, ``Enter`` edit the selected
+      layer's fields, ``s`` save (return the layers), ``Esc`` / ``q`` cancel.
+    * **catalog picker** - choose a layer type to append.
+    * **field editor** - per-field values, each edited on a single input line.
+
+    It mutates only its own copy of the layers and returns plain
+    :class:`BuiltLayer` data; the module turns that into a packet.
+    """
+
+    def __init__(self, stdscr, catalog: list[LayerType], initial: list[BuiltLayer], title: str) -> None:
+        self.stdscr = stdscr
+        self.catalog = catalog
+        self.by_name = {layer.name: layer for layer in catalog}
+        # Own copy so a cancel leaves the caller's `initial` untouched.
+        self.layers = [BuiltLayer(bl.name, dict(bl.values)) for bl in initial]
+        self.title = title or "Packet builder"
+        self.selected = 0
+
+    def run(self) -> list[BuiltLayer] | None:
+        try:
+            curses.curs_set(0)
+        except curses.error:  # some terminals don't support hiding the cursor
+            pass
+        self.stdscr.keypad(True)
+        while True:
+            self._draw_layers()
+            key = self.stdscr.getch()
+            if key in (27, ord("q"), ord("Q")):
+                return None
+            if key in (ord("s"), ord("S")):
+                return self.layers
+            if key in (ord("a"), ord("A")):
+                chosen = self._pick_layer()
+                if chosen is not None:
+                    self.layers.append(
+                        BuiltLayer(chosen.name, {f.key: f.default for f in chosen.fields})
+                    )
+                    self.selected = len(self.layers) - 1
+                continue
+            if not self.layers:
+                continue
+            if key in (ord("d"), ord("D")):
+                del self.layers[self.selected]
+                self.selected = max(0, min(self.selected, len(self.layers) - 1))
+            elif key in _ENTER_KEYS:
+                self._edit_layer(self.layers[self.selected])
+            elif key == ord("[") and self.selected > 0:
+                self.layers[self.selected - 1], self.layers[self.selected] = (
+                    self.layers[self.selected], self.layers[self.selected - 1]
+                )
+                self.selected -= 1
+            elif key == ord("]") and self.selected < len(self.layers) - 1:
+                self.layers[self.selected + 1], self.layers[self.selected] = (
+                    self.layers[self.selected], self.layers[self.selected + 1]
+                )
+                self.selected += 1
+            elif key == curses.KEY_UP:
+                self.selected = max(0, self.selected - 1)
+            elif key == curses.KEY_DOWN:
+                self.selected = min(len(self.layers) - 1, self.selected + 1)
+
+    def _draw_layers(self) -> None:
+        stdscr = self.stdscr
+        height, width = stdscr.getmaxyx()
+        stdscr.erase()
+        header = f" {self.title}"
+        _safe_addstr(stdscr, 0, 0, header.ljust(width), curses.A_BOLD)
+        keys = " a:add  d:delete  Enter:edit  [ ]:reorder  s:save  Esc/q:cancel"
+        _safe_addstr(stdscr, 1, 0, keys.ljust(width), curses.A_UNDERLINE)
+        if not self.layers:
+            _safe_addstr(stdscr, 3, 0, "(no layers yet - press 'a' to add one)", curses.A_DIM)
+        for index, layer in enumerate(self.layers):
+            attr = curses.A_REVERSE if index == self.selected else curses.A_NORMAL
+            text = f" {index + 1}. {self._summary(layer)}"
+            _safe_addstr(stdscr, 3 + index, 0, _fit(text, width).ljust(width), attr)
+        footer = " 's' saves so you can name it; nothing is sent from here."
+        _safe_addstr(stdscr, height - 1, 0, footer.ljust(width), curses.A_DIM)
+        stdscr.refresh()
+
+    @staticmethod
+    def _summary(layer: BuiltLayer) -> str:
+        set_values = [f"{key}={value}" for key, value in layer.values.items() if value != ""]
+        return f"{layer.name}  {', '.join(set_values)}" if set_values else layer.name
+
+    def _pick_layer(self) -> LayerType | None:
+        stdscr = self.stdscr
+        selected = 0
+        while True:
+            height, width = stdscr.getmaxyx()
+            stdscr.erase()
+            _safe_addstr(
+                stdscr, 0, 0,
+                " Add layer  [Up/Down  Enter:add  Esc:cancel]".ljust(width),
+                curses.A_BOLD,
+            )
+            for index, layer_type in enumerate(self.catalog):
+                attr = curses.A_REVERSE if index == selected else curses.A_NORMAL
+                _safe_addstr(stdscr, 2 + index, 0, _fit(f" {layer_type.name}", width).ljust(width), attr)
+            stdscr.refresh()
+            key = stdscr.getch()
+            if key == 27:
+                return None
+            if key in _ENTER_KEYS:
+                return self.catalog[selected]
+            if key == curses.KEY_UP:
+                selected = max(0, selected - 1)
+            elif key == curses.KEY_DOWN:
+                selected = min(len(self.catalog) - 1, selected + 1)
+
+    def _edit_layer(self, layer: BuiltLayer) -> None:
+        stdscr = self.stdscr
+        layer_type = self.by_name.get(layer.name)
+        if layer_type is None or not layer_type.fields:
+            return
+        fields = layer_type.fields
+        selected = 0
+        while True:
+            height, width = stdscr.getmaxyx()
+            stdscr.erase()
+            _safe_addstr(
+                stdscr, 0, 0,
+                f" {layer.name} fields  [Up/Down  Enter:edit  Esc:back]".ljust(width),
+                curses.A_BOLD,
+            )
+            for index, field in enumerate(fields):
+                value = layer.values.get(field.key, "")
+                shown = value if value != "" else "(default)"
+                attr = curses.A_REVERSE if index == selected else curses.A_NORMAL
+                line = f" {field.label:<18} {shown}"
+                _safe_addstr(stdscr, 2 + index, 0, _fit(line, width).ljust(width), attr)
+            _safe_addstr(stdscr, height - 1, 0, _fit(f" {fields[selected].help}", width).ljust(width), curses.A_DIM)
+            stdscr.refresh()
+            key = stdscr.getch()
+            if key == 27:
+                return
+            if key == curses.KEY_UP:
+                selected = max(0, selected - 1)
+            elif key == curses.KEY_DOWN:
+                selected = min(len(fields) - 1, selected + 1)
+            elif key in _ENTER_KEYS:
+                field = fields[selected]
+                result = self._prompt_text(
+                    f"{layer.name}.{field.key}",
+                    field.help,
+                    layer.values.get(field.key, ""),
+                )
+                if result is not None:
+                    layer.values[field.key] = result
+
+    def _prompt_text(self, label: str, hint: str, initial: str) -> str | None:
+        """Edit a single value on one line; Enter commits, Esc keeps the old one."""
+        stdscr = self.stdscr
+        buffer = list(initial)
+        try:
+            curses.curs_set(1)
+        except curses.error:
+            pass
+        try:
+            while True:
+                height, width = stdscr.getmaxyx()
+                stdscr.erase()
+                _safe_addstr(stdscr, 0, 0, f" Edit {label}".ljust(width), curses.A_BOLD)
+                if hint:
+                    _safe_addstr(stdscr, 1, 0, _fit(f" {hint}", width).ljust(width), curses.A_DIM)
+                _safe_addstr(stdscr, 3, 0, "Enter=confirm  Esc=cancel  Backspace=delete", curses.A_DIM)
+                text = "".join(buffer)
+                _safe_addstr(stdscr, 5, 0, "> " + text)
+                stdscr.move(5, min(2 + len(text), width - 1))
+                stdscr.refresh()
+                key = stdscr.getch()
+                if key == 27:
+                    return None
+                if key in _ENTER_KEYS:
+                    return "".join(buffer)
+                if key in _BACKSPACE_KEYS:
+                    if buffer:
+                        buffer.pop()
+                elif 32 <= key <= 126:
+                    buffer.append(chr(key))
+        finally:
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
