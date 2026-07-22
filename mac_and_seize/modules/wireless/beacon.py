@@ -159,6 +159,9 @@ class BeaconService(MonitorRadioMixin):
         self._current_channel: int | None = None
         self._hopper_stop: threading.Event | None = None
         self._hopper_thread: threading.Thread | None = None
+        # A warning set during setup when the radio would not tune to the requested
+        # channel (so beacons are going out somewhere other than intended).
+        self._tune_warning = ""
         self._context: "AppContext | None" = None
 
     # --- Public API -----------------------------------------------------------
@@ -203,6 +206,7 @@ class BeaconService(MonitorRadioMixin):
             notes = ""
             if first:
                 iface = self._setup_radio_locked(channel)
+                notes = self._tune_warning  # loud if the radio wouldn't tune
             else:
                 iface = self._iface  # type: ignore[assignment]
                 if channel:
@@ -355,16 +359,7 @@ class BeaconService(MonitorRadioMixin):
         try:
             channels = self._resolve_channels(iface, channel_spec)
             self._channels = channels
-            self._current_channel = channels[0]
-            try:
-                wireless.set_channel(iface, channels[0])
-            except (ModuleError, ValueError) as exc:
-                # A pinned/limited radio may refuse to tune; advertise the channel
-                # anyway and inject on whatever it is parked on. Not fatal.
-                self._log.debug(
-                    "Beacon: initial tune of %s to channel %d failed: %s",
-                    iface, channels[0], exc,
-                )
+            self._current_channel = self._tune_locked(iface, channels[0])
             self._iface = iface
             if len(channels) > 1:
                 self._start_hopper_locked(iface, channels)
@@ -375,6 +370,42 @@ class BeaconService(MonitorRadioMixin):
             self._current_channel = None
             raise
         return iface
+
+    def _tune_locked(self, iface: str, channel: int) -> int:
+        """Tune ``iface`` to ``channel``; return the channel it is *actually* on.
+
+        A silent tune failure is the classic reason a beacon is invisible: some
+        drivers accept a channel change in monitor mode without moving the RF
+        (notably Realtek rtw88), or a held radio refuses it - so the beacon goes
+        out on a stale channel, often a 5 GHz one where regulatory NO-IR stops it
+        reaching the air at all. :func:`wireless.set_channel` verifies the retune
+        and raises on a mismatch; when it fails we find where the radio really is
+        and record :attr:`_tune_warning` so the caller surfaces it instead of
+        beaconing blind on the wrong channel.
+        """
+        self._tune_warning = ""
+        try:
+            wireless.set_channel(iface, channel)
+            return channel
+        except (ModuleError, ValueError) as exc:
+            self._log.debug("Beacon: could not tune %s to channel %d: %s", iface, channel, exc)
+        try:
+            actual = wireless.current_channel(iface)
+        except ModuleError:
+            actual = None
+        if actual is None or actual == channel:
+            return channel
+        self._tune_warning = (
+            f" WARNING: {iface} would not tune to channel {channel}; it is on "
+            f"channel {actual}, so beacons are being sent there, not on {channel}"
+            + (
+                " (a 5 GHz channel - regulatory NO-IR likely stops them reaching "
+                "the air at all)" if actual > 14 else ""
+            )
+            + f". {self.radio_hint(iface)}"
+        )
+        self._log.warning("Beacon: %s stuck on channel %s, wanted %s", iface, actual, channel)
+        return actual
 
     def _resolve_channels(self, iface: str, channel_spec: str | None) -> list[int]:
         """The channel plan: explicit ``--channel`` if given, else random 2.4 GHz."""
