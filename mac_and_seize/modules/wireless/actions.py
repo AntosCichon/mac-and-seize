@@ -167,9 +167,14 @@ def _filter_show(context: "AppContext", values: dict):
 
 def _beacon_spam(context: "AppContext", values: dict) -> str:
     # ``bssid`` is a `multiple` param, so the CLI fans out and calls this once per
-    # network name - each becomes its own background job.
+    # network name - each becomes its own background job. ``channel`` is a plain
+    # (non-multiple) option so a list/range stays one channel *plan*, not one job
+    # per channel; all fanned-out jobs share it (they share the one radio).
     return _beacon(context).spam(
-        context, values["bssid"], duration=values.get("duration")
+        context,
+        values["bssid"],
+        duration=values.get("duration"),
+        channel=values.get("channel"),
     )
 
 
@@ -374,21 +379,29 @@ def build_wireless_actions() -> list[Action]:
             "spam several at once - and each can be stopped independently with "
             "'wireless beacon stop <name>'. The radio is put into monitor mode "
             "automatically on the first job and restored when the last one stops; "
-            "while spamming, that interface has no network connectivity. --duration "
-            "stops each job automatically after N seconds (reported when it elapses). "
-            "The prompt stays usable while it runs. For authorized wireless security "
-            "testing only.",
+            "while spamming, that interface has no network connectivity. By default "
+            "the radio hops across its 2.4 GHz channels in random order (5 GHz is "
+            "often NO-IR, where an injected beacon never actually transmits); "
+            "--channel overrides that with a number, list (1,6,11) or range (1-11) - "
+            "a single channel is fixed, several are hopped, and each beacon is built "
+            "for its channel's band. The channel plan is shared by all jobs (one "
+            "radio) and set by the first. --duration stops each job automatically "
+            "after N seconds (reported when it elapses). The prompt stays usable "
+            "while it runs. For authorized wireless security testing only.",
             _beacon_spam,
             [
                 Param("bssid", "Network name(s) to advertise (SSID); comma list spams several",
                       multiple=True),
+                Param("channel", "Channel(s) to beacon on: number, list (1,6,11) or range "
+                      "(1-11); default: random 2.4 GHz", required=False),
                 Param("duration", "Stop each job automatically after N seconds", int,
                       required=False),
             ],
             [
                 "wireless beacon spam FreeWiFi",
                 "wireless beacon spam FreeWiFi,Corp-Guest",
-                "wireless beacon spam FreeWiFi --duration 60",
+                "wireless beacon spam FreeWiFi --channel 6",
+                "wireless beacon spam FreeWiFi --channel 1,6,11 --duration 60",
             ],
             requires_root=True,
         ),

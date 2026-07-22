@@ -101,7 +101,7 @@ class WirelessCaptureService(MonitorRadioMixin, PacketSession):
             rejected: list[int] = []
             unsupported: list[int] = []
             if sweep:
-                valid, rejected = wireless.validate_channels(self._parse_channels(sweep))
+                valid, rejected = wireless.validate_channels(wireless.parse_channel_spec(sweep))
                 if not valid:
                     raise ValueError("No valid IEEE 802.11 channels to sweep.")
                 # Keep only channels the radio can actually tune. A 2.4 GHz-only
@@ -322,7 +322,7 @@ class WirelessCaptureService(MonitorRadioMixin, PacketSession):
     def _run_activity(
         self, interface: str, channels_spec: str, dwell_ms: int
     ) -> tuple[list[dict], list[int]]:
-        valid, rejected = wireless.validate_channels(self._parse_channels(channels_spec))
+        valid, rejected = wireless.validate_channels(wireless.parse_channel_spec(channels_spec))
         if rejected:
             self._log.info(
                 "activity: excluding non-IEEE channels %s", rejected
@@ -528,23 +528,6 @@ class WirelessCaptureService(MonitorRadioMixin, PacketSession):
             "(it has no connectivity). Stop the capture ('wireless capture stop') "
             "to remove it."
         )
-
-    @staticmethod
-    def _parse_channels(spec: str) -> list[int]:
-        """Parse a channel spec: a number, a comma list, a range, or ``all``."""
-        spec = spec.strip().lower()
-        if spec == "all":
-            return wireless.ieee_channels()
-        channels: list[int] = []
-        for value in split_values(spec):
-            if not value.isdigit():
-                raise ValueError(
-                    f"Invalid channel {value!r}; expected a number, list, range, or 'all'."
-                )
-            channels.append(int(value))
-        if not channels:
-            raise ValueError("No channels given.")
-        return channels
 
     # --- Filters --------------------------------------------------------------
 

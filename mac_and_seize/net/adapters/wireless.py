@@ -18,6 +18,7 @@ import warnings
 
 from mac_and_seize.core.errors import ModuleError
 from mac_and_seize.observability import get_logger
+from mac_and_seize.util.parse import split_values
 
 # PyRIC 0.1.6.3 emits a benign SyntaxWarning (an unescaped ``\d`` in a regex) at
 # import/compile time. Silence it at this boundary, the same way scapy_io quiets
@@ -52,6 +53,42 @@ class WirelessError(ModuleError):
 def ieee_channels() -> list[int]:
     """Every IEEE 802.11 channel number this tool recognises (2.4 + 5 GHz)."""
     return list(IEEE_CHANNELS)
+
+
+def band_2ghz_channels() -> list[int]:
+    """The 2.4 GHz IEEE channels this tool recognises (1-14), in order.
+
+    The band that is (almost) always legal to *transmit* on in monitor mode - 5
+    GHz channels are frequently flagged NO-IR by the regulatory domain, so a
+    beacon injected there never actually leaves the radio. Used as the default
+    band for beacon injection.
+    """
+    return list(_CHANNELS_2GHZ)
+
+
+def parse_channel_spec(spec: str) -> list[int]:
+    """Parse a channel spec - a number, comma list, range, or ``all`` - to numbers.
+
+    The shared ``--sweep`` / ``--channel`` grammar: ``all`` expands to every IEEE
+    802.11 channel this tool recognises; otherwise commas and inclusive ranges
+    (via :func:`~mac_and_seize.util.parse.split_values`, e.g. ``1,6,11`` or
+    ``1-11``) are expanded. Raises :class:`ValueError` on a non-numeric token or
+    an empty spec. Does **not** check the card can tune the result - intersect
+    with :func:`supported_channels` for that.
+    """
+    spec = spec.strip().lower()
+    if spec == "all":
+        return ieee_channels()
+    channels: list[int] = []
+    for value in split_values(spec):
+        if not value.isdigit():
+            raise ValueError(
+                f"Invalid channel {value!r}; expected a number, list, range, or 'all'."
+            )
+        channels.append(int(value))
+    if not channels:
+        raise ValueError("No channels given.")
+    return channels
 
 
 def supported_channels(name: str) -> list[int]:

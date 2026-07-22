@@ -9,10 +9,20 @@ phantom access points.
 
 Each ``spam`` starts an independent background job keyed by the advertised
 network, so several run at once and any one stops on its own. The first job puts
-the radio into monitor mode (and tunes a channel); the last job to stop restores
-the radio - exactly like the capture service. A ``--duration`` makes a job stop
-itself after N seconds; that end-of-run is reported out of band via the
-front-end-safe :meth:`notify` channel (never a raw write from the worker thread).
+the radio into monitor mode and establishes the **channel plan**; the last job to
+stop restores the radio - exactly like the capture service.
+
+Channels
+--------
+A monitor radio is on one channel at a time, so the channel plan belongs to the
+shared radio, not to a single job. By default a job hops across the card's 2.4
+GHz channels in randomized order - 2.4 GHz because 5 GHz channels are frequently
+flagged NO-IR by the regulatory domain, where an injected beacon never actually
+leaves the radio (a real-world gotcha after a connection manager is killed and
+the regdomain falls back to the restrictive world domain). ``--channel`` overrides
+the plan with an explicit number / list / range (a single channel is fixed; a set
+is hopped across); each beacon's contents are built to match the band of the
+channel it goes out on. The plan is set by the first job; concurrent jobs share it.
 
 Injection requires root; the CLI gates the actions. This is standard wireless
 security-assessment tooling (a beacon flood, cf. ``mdk4``) - for use only against
@@ -42,8 +52,12 @@ if TYPE_CHECKING:
 #: every frame, so it stays visible without pegging a CPU or the radio.
 BEACON_INTERVAL_S = 0.1
 
-#: Channel a job tunes the radio to (and advertises) when no channel is set yet.
-#: 2.4 GHz channel 1 is universally supported.
+#: Seconds the shared radio dwells on each channel when the plan hops several. A
+#: few beacons land on each channel per visit, enough for a scanner passing
+#: through to catch one.
+BEACON_HOP_INTERVAL_S = 0.5
+
+#: Ultimate fallback channel if the card reports no tunable 2.4 GHz channel.
 DEFAULT_BEACON_CHANNEL = 1
 
 #: 802.11 caps the SSID information element at 32 bytes.
@@ -54,8 +68,13 @@ _MAX_SSID_BYTES = 32
 #: spin forever logging.
 _MAX_CONSECUTIVE_FAILURES = 50
 
-#: Supported-rates information element (1-54 Mbit/s) so the fake AP looks plausible.
-_SUPPORTED_RATES = b"\x82\x84\x8b\x96\x24\x30\x48\x6c"
+#: Supported-rates IE for a 2.4 GHz beacon: 1/2/5.5/11 Mbit/s basic (CCK/DSSS) +
+#: 18/24/36/54 OFDM. The CCK basic rates only exist in 2.4 GHz.
+_RATES_2GHZ = b"\x82\x84\x8b\x96\x24\x30\x48\x6c"
+
+#: Supported-rates IE for a 5 GHz beacon: OFDM only (6/9/12/18/24/36/48/54), with
+#: 6/12/24 marked basic. A 5 GHz beacon must not advertise the CCK rates above.
+_RATES_5GHZ = b"\x8c\x12\x98\x24\xb0\x48\x60\x6c"
 
 
 def _random_mac() -> str:
@@ -71,7 +90,13 @@ def _random_mac() -> str:
 
 
 def _beacon_frame(ssid: str, source: str, channel: int):
-    """Build one 802.11 beacon advertising ``ssid`` from bogus address ``source``."""
+    """Build one 802.11 beacon advertising ``ssid`` from bogus address ``source``.
+
+    The information elements are built for the band of ``channel`` - a 2.4 GHz
+    frame carries CCK-capable rates and a DS Parameter Set element; a 5 GHz frame
+    carries OFDM-only rates and omits the (DSSS-only) DS Parameter Set - so the
+    frame is not rejected as malformed by clients on that band.
+    """
     dot11 = Dot11(
         type=0,  # management
         subtype=8,  # beacon
@@ -81,9 +106,13 @@ def _beacon_frame(ssid: str, source: str, channel: int):
     )
     beacon = Dot11Beacon(cap="ESS")  # an open (unencrypted) infrastructure network
     ssid_elt = Dot11Elt(ID="SSID", info=ssid.encode("utf-8", "replace"))
-    rates_elt = Dot11Elt(ID="Rates", info=_SUPPORTED_RATES)
-    dsset_elt = Dot11Elt(ID="DSset", info=bytes([channel & 0xFF]))
-    return RadioTap() / dot11 / beacon / ssid_elt / rates_elt / dsset_elt
+    if channel <= 14:  # 2.4 GHz
+        rates_elt = Dot11Elt(ID="Rates", info=_RATES_2GHZ)
+        dsset_elt = Dot11Elt(ID="DSset", info=bytes([channel & 0xFF]))
+        return RadioTap() / dot11 / beacon / ssid_elt / rates_elt / dsset_elt
+    # 5 GHz: OFDM-only rates, no DSSS DS Parameter Set element.
+    rates_elt = Dot11Elt(ID="Rates", info=_RATES_5GHZ)
+    return RadioTap() / dot11 / beacon / ssid_elt / rates_elt
 
 
 @dataclass
@@ -91,7 +120,6 @@ class BeaconJob:
     """One running beacon-spam job (one advertised SSID)."""
 
     ssid: str
-    channel: int
     iface: str
     duration: float | None
     stop_event: threading.Event
@@ -110,23 +138,34 @@ class BeaconService(MonitorRadioMixin):
         self._log = get_logger(__name__)
         self._lock = threading.RLock()
         self._jobs: dict[str, BeaconJob] = {}
-        # The single monitor interface/channel all jobs share (one radio). Set up
+        # The single monitor interface all jobs share (one radio), its channel
+        # plan, and the channel it is on right now (updated by the hopper). Set up
         # by the first job, torn down by the last.
         self._iface: str | None = None
-        self._channel: int | None = None
+        self._channels: list[int] = []
+        self._current_channel: int | None = None
+        self._hopper_stop: threading.Event | None = None
+        self._hopper_thread: threading.Thread | None = None
         self._context: "AppContext | None" = None
 
     # --- Public API -----------------------------------------------------------
 
     def spam(
-        self, context: "AppContext", bssid: str, *, duration: int | None = None
+        self,
+        context: "AppContext",
+        bssid: str,
+        *,
+        duration: int | None = None,
+        channel: str | None = None,
     ) -> str:
         """Start a background job flooding beacons that advertise ``bssid``.
 
         ``bssid`` is the network name (SSID) to advertise; each frame goes out
         from a fresh randomized address. The first job prepares monitor mode and
-        a channel; ``duration`` (seconds) makes this job stop itself. Raises if a
-        job for the same name is already running.
+        the channel plan: ``channel`` (a number/list/range) overrides the default
+        of hopping the card's 2.4 GHz channels in random order. ``duration``
+        (seconds) makes this job stop itself. Raises if a job for the same name is
+        already running.
         """
         ssid = (bssid or "").strip()
         if not ssid:
@@ -146,11 +185,20 @@ class BeaconService(MonitorRadioMixin):
                 )
             self._context = context
             first = not self._jobs
-            iface = self._ensure_iface_locked(first)
+            notes = ""
+            if first:
+                iface = self._setup_radio_locked(channel)
+            else:
+                iface = self._iface  # type: ignore[assignment]
+                if channel:
+                    notes = (
+                        " NOTE: a beacon session is already running on "
+                        f"{self._plan_description()}; --channel applies only to the "
+                        "first job and was ignored."
+                    )
             try:
                 job = BeaconJob(
                     ssid=ssid,
-                    channel=self._channel or DEFAULT_BEACON_CHANNEL,
                     iface=iface,
                     duration=float(duration) if duration else None,
                     stop_event=threading.Event(),
@@ -166,16 +214,17 @@ class BeaconService(MonitorRadioMixin):
                 self._jobs[ssid] = job
                 job.thread.start()
             except BaseException:
-                # Nothing registered, but the first job may have just switched the
-                # radio into monitor mode - undo it so we don't strand the NIC.
+                # The first job may have just set up the radio; undo it so we don't
+                # strand the NIC in monitor mode with a running hopper.
                 if first and not self._jobs:
                     self._teardown_iface_locked()
                 raise
+            plan = self._plan_description()
 
         limit = f", stopping after {int(duration)}s" if duration else ""
         return (
-            f"Beacon spam started for {ssid!r} on {iface} (channel {job.channel}){limit}. "
-            f"Stop it with 'wireless beacon stop {ssid}'."
+            f"Beacon spam started for {ssid!r} on {iface} ({plan}){limit}. "
+            f"Stop it with 'wireless beacon stop {ssid}'.{notes}"
         )
 
     def stop(self, bssid: str) -> str:
@@ -225,8 +274,9 @@ class BeaconService(MonitorRadioMixin):
             while not job.stop_event.is_set():
                 if deadline is not None and time.monotonic() >= deadline:
                     break
+                channel = self._current_channel or DEFAULT_BEACON_CHANNEL
                 try:
-                    scapy_io.send_l2(_beacon_frame(job.ssid, _random_mac(), job.channel), job.iface)
+                    scapy_io.send_l2(_beacon_frame(job.ssid, _random_mac(), channel), job.iface)
                     job.sent += 1
                     failures = 0
                 except OSError as exc:
@@ -280,36 +330,124 @@ class BeaconService(MonitorRadioMixin):
 
     # --- Radio setup / teardown (all under self._lock) ------------------------
 
-    def _ensure_iface_locked(self, first: bool) -> str:
-        """Return the shared monitor interface, preparing it for the first job."""
-        if not first and self._iface is not None:
-            return self._iface
+    def _setup_radio_locked(self, channel_spec: str | None) -> str:
+        """Prepare the shared monitor interface and channel plan for the first job."""
         iface = self._ensure_monitor(None)  # may raise ModuleError (radio held, etc.)
         try:
-            channel = wireless.current_channel(iface)
-        except ModuleError:
-            channel = None
-        if not channel:
-            channel = DEFAULT_BEACON_CHANNEL
+            channels = self._resolve_channels(iface, channel_spec)
+            self._channels = channels
+            self._current_channel = channels[0]
             try:
-                wireless.set_channel(iface, DEFAULT_BEACON_CHANNEL)
+                wireless.set_channel(iface, channels[0])
             except (ModuleError, ValueError) as exc:
-                # A pinned/limited radio may refuse to tune; advertise the default
-                # anyway and inject on whatever channel it is parked on. Not fatal.
+                # A pinned/limited radio may refuse to tune; advertise the channel
+                # anyway and inject on whatever it is parked on. Not fatal.
                 self._log.debug(
-                    "Beacon: could not tune %s to channel %d: %s",
-                    iface, DEFAULT_BEACON_CHANNEL, exc,
+                    "Beacon: initial tune of %s to channel %d failed: %s",
+                    iface, channels[0], exc,
                 )
-        self._iface = iface
-        self._channel = channel
+            self._iface = iface
+            if len(channels) > 1:
+                self._start_hopper_locked(iface, channels)
+        except BaseException:
+            self._teardown_monitor(note=False)
+            self._iface = None
+            self._channels = []
+            self._current_channel = None
+            raise
         return iface
 
+    def _resolve_channels(self, iface: str, channel_spec: str | None) -> list[int]:
+        """The channel plan: explicit ``--channel`` if given, else random 2.4 GHz."""
+        supported = set(wireless.supported_channels(iface))
+        if channel_spec:
+            valid, rejected = wireless.validate_channels(
+                wireless.parse_channel_spec(channel_spec)  # raises ValueError on junk
+            )
+            if not valid:
+                raise ValueError("No valid IEEE 802.11 channels in --channel.")
+            tunable = [c for c in valid if c in supported]
+            unsupported = [c for c in valid if c not in supported]
+            if not tunable:
+                raise ModuleError(
+                    f"{iface} cannot tune any of the requested channel(s) {valid}. "
+                    "It may be a 2.4 GHz-only radio, or these are 5 GHz/DFS channels "
+                    "the driver does not support."
+                )
+            if rejected:
+                self._log.info("beacon: excluding non-IEEE channels %s", rejected)
+            if unsupported:
+                self._log.info("beacon: %s cannot tune %s; skipped", iface, unsupported)
+            return tunable
+        # Default: the card's 2.4 GHz channels in randomized order (5 GHz is often
+        # NO-IR, so an injected beacon there never transmits - see module docs).
+        two_ghz = [c for c in wireless.band_2ghz_channels() if c in supported]
+        if not two_ghz:
+            two_ghz = sorted(supported) or [DEFAULT_BEACON_CHANNEL]
+        random.shuffle(two_ghz)
+        return two_ghz
+
     def _teardown_iface_locked(self) -> str:
-        """Restore the radio and clear the shared interface; return the note."""
+        """Stop the hopper, restore the radio, clear shared state; return the note."""
+        self._stop_hopper_locked()
         self._teardown_monitor()
         self._iface = None
-        self._channel = None
+        self._channels = []
+        self._current_channel = None
         return self.pop_teardown_note()
+
+    def _start_hopper_locked(self, iface: str, channels: list[int]) -> None:
+        """Spawn a thread that retunes ``iface`` across ``channels`` (already >1)."""
+        stop = threading.Event()
+
+        def run() -> None:
+            index = 0
+            while not stop.is_set():
+                index += 1
+                channel = channels[index % len(channels)]
+                try:
+                    wireless.set_channel(iface, channel)
+                    self._current_channel = channel
+                except Exception as exc:  # noqa: BLE001 - a bad channel must not kill the hop
+                    # Debug, not warning: this runs a few times a second.
+                    self._log.debug(
+                        "Beacon hop: could not tune %s to channel %d: %s",
+                        iface, channel, exc,
+                    )
+                stop.wait(BEACON_HOP_INTERVAL_S)
+
+        self._hopper_stop = stop
+        self._hopper_thread = threading.Thread(
+            target=run, name="wl-beacon-hopper", daemon=True
+        )
+        self._hopper_thread.start()
+        self._log.info(
+            "Beacon channel hopper started on %s (%d channels, %dms)",
+            iface, len(channels), int(BEACON_HOP_INTERVAL_S * 1000),
+        )
+
+    def _stop_hopper_locked(self) -> None:
+        """Signal and join the channel hopper, if one is running."""
+        stop, thread = self._hopper_stop, self._hopper_thread
+        self._hopper_stop = None
+        self._hopper_thread = None
+        if stop is not None:
+            stop.set()
+        if (
+            thread is not None
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            thread.join(timeout=2.0)
+
+    def _plan_description(self) -> str:
+        """Human-readable description of the shared channel plan."""
+        channels = self._channels
+        if not channels:
+            return "channel ?"
+        if len(channels) == 1:
+            return f"channel {channels[0]}"
+        return f"hopping channels {','.join(str(c) for c in sorted(channels))}"
 
     def _reap_locked(self) -> None:
         """Drop jobs whose worker already exited (defensive: workers self-remove)."""
