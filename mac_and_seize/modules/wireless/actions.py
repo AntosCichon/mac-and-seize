@@ -175,6 +175,7 @@ def _beacon_spam(context: "AppContext", values: dict) -> str:
         values["bssid"],
         duration=values.get("duration"),
         channel=values.get("channel"),
+        randomize=values.get("randomize", False),
     )
 
 
@@ -377,7 +378,13 @@ def build_wireless_actions() -> list[Action]:
             "address, so scanners see a stream of phantom access points (requires "
             "root). Every name starts its own background job - pass a comma list to "
             "spam several at once - and each can be stopped independently with "
-            "'wireless beacon stop <name>'. The radio is put into monitor mode "
+            "'wireless beacon stop <name>'. By default each job beacons from a "
+            "single bogus (random, locally-administered) BSSID, steadily like a "
+            "real AP, so the network shows up as a stable entry in a device's Wi-Fi "
+            "list; --randomize instead sends a fresh bogus address on every frame "
+            "(a phantom-AP flood - louder, but a phone's network list hides an SSID "
+            "whose BSSID never settles, so that mode is for a Wi-Fi analyzer, not "
+            "for making one network appear). The radio is put into monitor mode "
             "automatically on the first job and restored when the last one stops; "
             "while spamming, that interface has no network connectivity. By default "
             "the radio hops across its 2.4 GHz channels in random order (5 GHz is "
@@ -396,12 +403,15 @@ def build_wireless_actions() -> list[Action]:
                       "(1-11); default: random 2.4 GHz", required=False),
                 Param("duration", "Stop each job automatically after N seconds", int,
                       required=False),
+                Param("randomize", "Send a fresh bogus BSSID on every frame (phantom-AP "
+                      "flood) instead of one stable BSSID", bool, required=False,
+                      default=False, is_flag=True),
             ],
             [
                 "wireless beacon spam FreeWiFi",
-                "wireless beacon spam FreeWiFi,Corp-Guest",
                 "wireless beacon spam FreeWiFi --channel 6",
-                "wireless beacon spam FreeWiFi --channel 1,6,11 --duration 60",
+                "wireless beacon spam FreeWiFi,Corp-Guest --channel 1,6,11 --duration 60",
+                "wireless beacon spam PhantomNet --randomize",
             ],
             requires_root=True,
         ),

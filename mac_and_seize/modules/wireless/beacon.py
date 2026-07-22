@@ -3,14 +3,23 @@
 The injection counterpart to the wireless capture service: it reuses the same
 monitor-mode radio lifecycle (:class:`~mac_and_seize.modules.wireless.radio.MonitorRadioMixin`)
 but, instead of *receiving* frames, it *transmits* them - flooding IEEE 802.11
-beacon frames that advertise a chosen network name (SSID), each frame sent from a
-fresh, randomized (bogus) BSSID/source address so a scanner sees a stream of
-phantom access points.
+beacon frames that advertise a chosen network name (SSID) from a bogus (random,
+locally-administered) BSSID/source address.
 
 Each ``spam`` starts an independent background job keyed by the advertised
 network, so several run at once and any one stops on its own. The first job puts
 the radio into monitor mode and establishes the **channel plan**; the last job to
 stop restores the radio - exactly like the capture service.
+
+BSSID mode
+----------
+By default a job picks **one** bogus BSSID when it starts and beacons it steadily
+(~10/s, like a real AP), so the network shows up as a normal, stable entry in a
+phone's Wi-Fi list. ``--randomize`` instead sends a **fresh** bogus address on
+every frame, so a scanner sees a stream of phantom access points - louder, but a
+phone's available-networks list aggregates by BSSID and hides an SSID whose BSSID
+never settles, so use ``--randomize`` for a flood observed in a Wi-Fi analyzer,
+not to make one named network appear.
 
 Channels
 --------
@@ -120,6 +129,10 @@ class BeaconJob:
     """One running beacon-spam job (one advertised SSID)."""
 
     ssid: str
+    #: The bogus BSSID/source address. Used as-is every frame (stable AP), or as a
+    #: placeholder ignored in favour of a fresh one per frame when ``randomize``.
+    bssid: str
+    randomize: bool
     iface: str
     duration: float | None
     stop_event: threading.Event
@@ -157,15 +170,17 @@ class BeaconService(MonitorRadioMixin):
         *,
         duration: int | None = None,
         channel: str | None = None,
+        randomize: bool = False,
     ) -> str:
-        """Start a background job flooding beacons that advertise ``bssid``.
+        """Start a background job beaconing the network name ``bssid``.
 
-        ``bssid`` is the network name (SSID) to advertise; each frame goes out
-        from a fresh randomized address. The first job prepares monitor mode and
-        the channel plan: ``channel`` (a number/list/range) overrides the default
-        of hopping the card's 2.4 GHz channels in random order. ``duration``
-        (seconds) makes this job stop itself. Raises if a job for the same name is
-        already running.
+        ``bssid`` is the network name (SSID) to advertise. By default the job
+        beacons from a single bogus BSSID it picks now, so it appears as a stable
+        AP; ``randomize`` sends a fresh bogus address on every frame (phantom-AP
+        flood) instead. The first job prepares monitor mode and the channel plan:
+        ``channel`` (a number/list/range) overrides the default of hopping the
+        card's 2.4 GHz channels in random order. ``duration`` (seconds) makes this
+        job stop itself. Raises if a job for the same name is already running.
         """
         ssid = (bssid or "").strip()
         if not ssid:
@@ -199,6 +214,8 @@ class BeaconService(MonitorRadioMixin):
             try:
                 job = BeaconJob(
                     ssid=ssid,
+                    bssid=_random_mac(),
+                    randomize=bool(randomize),
                     iface=iface,
                     duration=float(duration) if duration else None,
                     stop_event=threading.Event(),
@@ -221,9 +238,10 @@ class BeaconService(MonitorRadioMixin):
                 raise
             plan = self._plan_description()
 
+        addr = "randomized BSSID per frame" if randomize else f"BSSID {job.bssid}"
         limit = f", stopping after {int(duration)}s" if duration else ""
         return (
-            f"Beacon spam started for {ssid!r} on {iface} ({plan}){limit}. "
+            f"Beacon spam started for {ssid!r} ({addr}) on {iface} ({plan}){limit}. "
             f"Stop it with 'wireless beacon stop {ssid}'.{notes}"
         )
 
@@ -275,8 +293,9 @@ class BeaconService(MonitorRadioMixin):
                 if deadline is not None and time.monotonic() >= deadline:
                     break
                 channel = self._current_channel or DEFAULT_BEACON_CHANNEL
+                source = _random_mac() if job.randomize else job.bssid
                 try:
-                    scapy_io.send_l2(_beacon_frame(job.ssid, _random_mac(), channel), job.iface)
+                    scapy_io.send_l2(_beacon_frame(job.ssid, source, channel), job.iface)
                     job.sent += 1
                     failures = 0
                 except OSError as exc:
