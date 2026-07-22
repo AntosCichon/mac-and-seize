@@ -51,10 +51,29 @@ class CursesPresenter:
         # `_deferred` and table() flushes it once the viewer closes.
         self._viewer_active = False
         self._deferred: list[str] = []
+        # The *real* terminal stream our out-of-band writes must go to. The REPL
+        # sets this when it proxies sys.stdout/sys.stderr (so stray background
+        # writes land above the prompt); emit_line() must bypass that proxy and
+        # write to the true terminal, or it would feed its own output back into
+        # the proxy and recurse. ``None`` means "not proxied - use sys.stdout".
+        self._terminal_stream = None
 
     def set_prompt_provider(self, provider: Callable[[], str]) -> None:
         """Let the REPL tell us how to redraw the current prompt line."""
         self._prompt_provider = provider
+
+    def set_terminal_stream(self, stream) -> None:
+        """Point out-of-band writes at the real terminal (see ``_terminal``).
+
+        Called by the REPL with the genuine ``sys.stdout`` right before it swaps
+        in a prompt-aware proxy, and with ``None`` on teardown.
+        """
+        self._terminal_stream = stream
+
+    @property
+    def _terminal(self):
+        """The stream out-of-band lines are written to (the real terminal)."""
+        return self._terminal_stream if self._terminal_stream is not None else sys.stdout
 
     def table(self, rows: list[dict], columns: list[Column], *, title: str) -> None:
         with self._lock:
@@ -68,9 +87,9 @@ class CursesPresenter:
             # The viewer has restored the terminal; emit anything that arrived
             # while it was open, before the REPL redraws its next prompt.
             for line in deferred:
-                sys.stdout.write(line + "\n")
+                self._terminal.write(line + "\n")
             if deferred:
-                sys.stdout.flush()
+                self._terminal.flush()
 
     def build_packet(
         self,
@@ -90,9 +109,9 @@ class CursesPresenter:
             # The builder has restored the terminal; emit anything that arrived
             # while it was open, before the REPL redraws its next prompt.
             for line in deferred:
-                sys.stdout.write(line + "\n")
+                self._terminal.write(line + "\n")
             if deferred:
-                sys.stdout.flush()
+                self._terminal.flush()
 
     def notify(self, message: str) -> None:
         """Print ``message`` in green *above* the prompt, leaving it intact."""
@@ -117,6 +136,7 @@ class CursesPresenter:
             and sys.stdout.isatty()
             and sys.stdin.isatty()
         )
+        out = self._terminal
         with self._lock:
             if self._viewer_active:
                 # A curses viewer owns the screen; hold the line until it closes.
@@ -124,15 +144,71 @@ class CursesPresenter:
                 return
             if not interactive:
                 prefix = "\n" if spaced_fallback else ""
-                sys.stdout.write(f"{prefix}{line}\n")
-                sys.stdout.flush()
+                out.write(f"{prefix}{line}\n")
+                out.flush()
                 return
             prompt = self._prompt_provider()
             buffer = readline.get_line_buffer()
             # \r -> column 0, \x1b[K -> clear to end of line, then the line, then
             # repaint prompt + the user's partially-typed command.
-            sys.stdout.write(f"\r\x1b[K{line}\n{prompt}{buffer}")
-            sys.stdout.flush()
+            out.write(f"\r\x1b[K{line}\n{prompt}{buffer}")
+            out.flush()
+
+
+class PromptAwareStream:
+    """A ``sys.stdout``/``sys.stderr`` proxy that keeps stray writes off the prompt.
+
+    The prompt-aware *log* handler only catches records that flow through the
+    logging system. Anything that writes to the real stream directly - a stray
+    ``print`` from a worker thread, a library that bypasses logging, a traceback
+    on a background thread - would still land raw on the prompt line. Installed
+    by the REPL for the session, this proxy closes that gap app-wide:
+
+    * writes from the **main thread** pass straight through (the REPL's own
+      output, ``input()``'s prompt, rich tables - all untouched);
+    * writes from a **background thread** are buffered per thread until a newline
+      and then lifted *above* the prompt via the presenter, exactly like an
+      out-of-band log line.
+
+    The presenter's own out-of-band writes go to the real stream (see
+    :meth:`CursesPresenter.set_terminal_stream`), so routing background writes
+    through it here never feeds back into the proxy.
+    """
+
+    def __init__(self, real, presenter: "CursesPresenter") -> None:
+        self._real = real
+        self._presenter = presenter
+        self._buffers: dict[int, str] = {}
+        self._lock = threading.Lock()
+
+    def write(self, s) -> int:
+        if not isinstance(s, str):
+            return self._real.write(s)
+        if threading.current_thread() is threading.main_thread():
+            return self._real.write(s)
+        # Background thread: accumulate and emit only complete lines above the
+        # prompt, holding any trailing partial line until its newline arrives.
+        with self._lock:
+            data = self._buffers.get(threading.get_ident(), "") + s
+            parts = data.split("\n")
+            self._buffers[threading.get_ident()] = parts.pop()
+        for line in parts:
+            self._presenter.emit_line(line)
+        return len(s)
+
+    def flush(self) -> None:
+        self._real.flush()
+
+    def isatty(self) -> bool:
+        return self._real.isatty()
+
+    def fileno(self) -> int:
+        return self._real.fileno()
+
+    def __getattr__(self, name):
+        # Delegate everything else (encoding, writable, buffer, ...) to the real
+        # stream. Only reached for attributes not defined above.
+        return getattr(self._real, name)
 
 
 class PromptAwareLogHandler(logging.Handler):

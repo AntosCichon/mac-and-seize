@@ -44,7 +44,7 @@ except ImportError:  # pragma: no cover - readline is unavailable on some OSes
 from rich.console import Console
 from rich.table import Table
 
-from mac_and_seize.cli.tui import PromptAwareLogHandler
+from mac_and_seize.cli.tui import PromptAwareLogHandler, PromptAwareStream
 from mac_and_seize.core.actions import Action
 from mac_and_seize.core.context import AppContext
 from mac_and_seize.core.errors import ModuleError
@@ -260,11 +260,12 @@ def run_interactive(context: AppContext) -> None:
         context.presenter.set_prompt_provider(
             lambda: _prompt(context_path).replace("\001", "").replace("\002", "")
         )
-    # Route app log records around (not through) the live prompt for the
-    # duration of the session: a scan worker logging while the user sits at the
-    # prompt would otherwise corrupt the line (same failure mode as an
-    # out-of-band notify()).
-    _restore_log_handler = _install_prompt_log_handler(context)
+    # Keep *all* out-of-band output off the live prompt for the duration of the
+    # session: app log records, third-party library logs (scapy logs errors
+    # straight to stderr from its own threads), and any stray write to
+    # stdout/stderr from a worker thread. Each is lifted above the prompt instead
+    # of corrupting the line; everything is restored on exit.
+    _restore_output_guards = _install_prompt_output_guards(context)
     console.print(
         "\n[bold]Interactive session.[/] "
         "Type '[cyan]help[/]' to get started, '[cyan]quit[/]' to exit.\n"
@@ -312,19 +313,28 @@ def run_interactive(context: AppContext) -> None:
                 console.print(f"[red]Unexpected error:[/] {exc}")
                 logger.exception("Unexpected error handling: %s", " ".join(tokens))
     finally:
-        _restore_log_handler()
+        _restore_output_guards()
 
     console.print("Goodbye.")
     logger.info("Interactive session ended")
 
 
-def _install_prompt_log_handler(context: AppContext) -> Callable[[], None]:
-    """Swap the app's console log handler for a prompt-aware one for the session.
+def _install_prompt_output_guards(context: AppContext) -> Callable[[], None]:
+    """Keep every out-of-band write off the live prompt for the session.
 
-    Returns a zero-arg callable that restores the original handler. When the
-    session isn't an interactive TTY, or the presenter can't redraw the prompt,
-    this is a no-op (returns a callable that does nothing) so piped/headless
-    runs keep the plain stderr handler.
+    Installs, in order, the guards that lift background output *above* the
+    prompt instead of letting it corrupt the line, and returns a single callable
+    that tears them all down (in reverse) on exit. When the session isn't an
+    interactive TTY, or the presenter can't redraw the prompt, this is a no-op
+    (piped/headless runs keep plain behaviour). The guards are:
+
+    1. logging - route the app logger *and* the root logger (which catches
+       third-party libraries like scapy) through a prompt-aware handler, and
+       strip any stray stderr/stdout handler a library attached to its own
+       logger so it can no longer write raw to the terminal;
+    2. streams - proxy ``sys.stdout``/``sys.stderr`` so even a direct write from
+       a worker thread (a stray ``print``, a traceback, a library that bypasses
+       logging) is lifted above the prompt.
     """
     interactive = (
         readline is not None
@@ -332,22 +342,126 @@ def _install_prompt_log_handler(context: AppContext) -> Callable[[], None]:
         and sys.stdout.isatty()
         and hasattr(context.presenter, "emit_line")
     )
-    app_logger = logging.getLogger(LOGGER_NAME)
-    original = next(
-        (h for h in app_logger.handlers if h.get_name() == "console"), None
-    )
-    if not interactive or original is None:
+    if not interactive:
         return lambda: None
 
-    handler = PromptAwareLogHandler(context.presenter)
-    handler.setLevel(original.level)
-    handler.setFormatter(original.formatter)
-    app_logger.removeHandler(original)
-    app_logger.addHandler(handler)
+    restores = [
+        _route_logging_above_prompt(context.presenter),
+        _proxy_streams_above_prompt(context.presenter),
+    ]
 
     def restore() -> None:
-        app_logger.removeHandler(handler)
-        app_logger.addHandler(original)
+        for undo in reversed(restores):
+            undo()
+
+    return restore
+
+
+def _route_logging_above_prompt(presenter) -> Callable[[], None]:
+    """Send app and third-party log records above the prompt; return the undo.
+
+    Swaps the plain ``"console"`` stderr handler on the app logger for a
+    prompt-aware one, adds a prompt-aware handler to the *root* logger so records
+    from third-party libraries (which don't sit under the app namespace) are
+    caught too, and reroutes any stray console handler those libraries attached
+    to their own loggers (scapy is the prime offender - see
+    :func:`_reroute_stray_console_handlers`).
+    """
+    undo: list[Callable[[], None]] = []
+    for target in (logging.getLogger(LOGGER_NAME), logging.getLogger()):
+        original = next(
+            (h for h in target.handlers if h.get_name() == "console"), None
+        )
+        handler = PromptAwareLogHandler(presenter)
+        handler.set_name("console")
+        if original is not None:
+            handler.setLevel(original.level)
+            handler.setFormatter(original.formatter)
+            target.removeHandler(original)
+        else:
+            # The root logger has no console handler of its own; give the
+            # prompt-aware one a sane level/format for third-party records.
+            handler.setLevel(logging.WARNING)
+            handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+        target.addHandler(handler)
+        undo.append(
+            lambda t=target, h=handler, o=original: _swap_handler_back(t, h, o)
+        )
+    undo.append(_reroute_stray_console_handlers())
+
+    def restore() -> None:
+        for step in reversed(undo):
+            step()
+
+    return restore
+
+
+def _swap_handler_back(
+    target: logging.Logger, added: logging.Handler, original: logging.Handler | None
+) -> None:
+    """Remove the prompt-aware ``added`` handler and restore ``original`` (if any)."""
+    target.removeHandler(added)
+    if original is not None:
+        target.addHandler(original)
+
+
+def _reroute_stray_console_handlers() -> Callable[[], None]:
+    """Strip stderr/stdout handlers libraries attach to their own loggers.
+
+    A library like scapy adds its own ``StreamHandler`` (bound to the real
+    stderr, with ``propagate=False``) and logs errors through it from background
+    threads - landing raw on the prompt, past every guard that only watches the
+    app logger. For the session we remove any such console handler and force the
+    logger to propagate, so its records flow up to the root prompt-aware handler
+    instead; the returned callable puts each handler (and the logger's original
+    ``propagate``) back. File handlers and our own handlers are left untouched.
+    """
+    std_streams = {sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__}
+    removed: list[tuple[logging.Logger, logging.Handler, bool]] = []
+    for name in list(logging.root.manager.loggerDict):
+        target = logging.getLogger(name)
+        if not isinstance(target, logging.Logger):
+            continue  # a PlaceHolder, not a real logger
+        if target.name == LOGGER_NAME or target.name.startswith(LOGGER_NAME + "."):
+            continue  # our own loggers are already handled
+        stripped = False
+        for handler in list(target.handlers):
+            if (
+                isinstance(handler, logging.StreamHandler)
+                and not isinstance(handler, logging.FileHandler)
+                and getattr(handler, "stream", None) in std_streams
+            ):
+                removed.append((target, handler, target.propagate))
+                target.removeHandler(handler)
+                stripped = True
+        if stripped and not target.propagate:
+            target.propagate = True  # so its records reach the root handler now
+
+    def restore() -> None:
+        for target, handler, propagate in removed:
+            target.addHandler(handler)
+            target.propagate = propagate
+
+    return restore
+
+
+def _proxy_streams_above_prompt(presenter) -> Callable[[], None]:
+    """Proxy stdout/stderr so worker-thread writes land above the prompt.
+
+    Points the presenter's out-of-band writes at the *real* stdout first (so its
+    own repaints bypass the proxy and can't recurse), then swaps in a
+    :class:`PromptAwareStream` for each stream. The returned callable restores
+    the originals.
+    """
+    real_stdout, real_stderr = sys.stdout, sys.stderr
+    presenter.set_terminal_stream(real_stdout)
+    sys.stdout = PromptAwareStream(real_stdout, presenter)
+    sys.stderr = PromptAwareStream(real_stderr, presenter)
+
+    def restore() -> None:
+        sys.stdout = real_stdout
+        sys.stderr = real_stderr
+        presenter.set_terminal_stream(None)
 
     return restore
 

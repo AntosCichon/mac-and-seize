@@ -21,6 +21,7 @@ from scapy.all import (
     Ether,
     conf,
     get_if_list,
+    sendp as _sendp,
     sniff as _sniff,
     sr,
     srp,
@@ -63,6 +64,34 @@ def refresh_interfaces() -> None:
     interface, before opening a socket on it.
     """
     conf.ifaces.reload()
+
+
+def refresh_network_state() -> None:
+    """Rebuild scapy's cached interface *and* routing tables from the live system.
+
+    scapy snapshots the interface list (``conf.ifaces``) and the kernel routing
+    tables (``conf.route`` / ``conf.route6``) once, at import time - i.e. when the
+    app launches. If the network changes afterwards (a cable moved to another NIC,
+    an interface brought up or down, an address reassigned), that snapshot goes
+    stale in two ways that both break a scan:
+
+    * an *interface-pinned* sweep (``discovery scan ens37``) resolves the NIC name
+      through the cached ``conf.ifaces`` and can pick up a stale/wrong ifindex, so
+      the probe leaves the wrong link - finding nothing real (and sometimes a
+      phantom reply from the stale path);
+    * an *unpinned* (routed) sweep (``discovery scan 192.168.1.0/24``) chooses its
+      egress from the cached routing table, which still points at the old
+      interface, so the probes go out a now-dead NIC and every host looks down.
+
+    Resyncing both right before a scan makes it send over whatever is actually up
+    now. Reads ``/proc`` only - cheap and needs no privileges.
+    """
+    conf.ifaces.reload()
+    conf.route.resync()
+    try:
+        conf.route6.resync()
+    except Exception:  # noqa: BLE001 - IPv6 routing is optional; never fail a scan over it
+        pass
 
 
 def expand_hosts(target: str) -> list[str]:
@@ -113,7 +142,11 @@ def expand_hosts(target: str) -> list[str]:
 
 
 def arp_probe(
-    hosts: list[str], *, timeout: float = 0.5, iface: str | None = None
+    hosts: list[str],
+    *,
+    timeout: float = 1.0,
+    retries: int = 2,
+    iface: str | None = None,
 ) -> dict[str, str]:
     """ARP-probe ``hosts`` (an explicit address list); return ``{ip: mac}``.
 
@@ -123,22 +156,33 @@ def arp_probe(
     the interface that is actually on the target subnet); ``None`` lets scapy
     pick its default. A ``filter="arp"`` BPF is installed on the receive socket
     so the sniffer only pulls ARP frames off the link (and Python-matches only
-    those), instead of every frame on a busy segment. The probe design mirrors
-    nmap's ARP host discovery (``-PR``); the implementation here is an original
-    scapy composition, not derived from nmap's source.
+    those), instead of every frame on a busy segment.
+
+    An ARP request (or its reply) can be dropped in transit, which would silently
+    lose a host, so each address is probed up to ``retries`` + 1 times: every
+    round re-probes only the addresses still unanswered, and the loop stops early
+    once every address has replied. The probe design mirrors nmap's ARP host
+    discovery (``-PR``); the implementation here is an original scapy composition,
+    not derived from nmap's source.
     """
     if not hosts:
         return {}
-    answered, _ = srp(
-        Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=hosts),
-        timeout=timeout,
-        iface=iface,
-        filter="arp",
-        verbose=False,
-    )
     found: dict[str, str] = {}
-    for _sent, received in answered:
-        found.setdefault(received.psrc, received.hwsrc)
+    # dedup while preserving order; only unanswered addresses carry to next round.
+    remaining = list(dict.fromkeys(hosts))
+    for _attempt in range(retries + 1):
+        if not remaining:
+            break
+        answered, _ = srp(
+            Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=remaining),
+            timeout=timeout,
+            iface=iface,
+            filter="arp",
+            verbose=False,
+        )
+        for _sent, received in answered:
+            found.setdefault(received.psrc, received.hwsrc)
+        remaining = [ip for ip in remaining if ip not in found]
     return found
 
 
@@ -164,6 +208,16 @@ def mac_vendor(mac: str | None) -> str | None:
     return vendor
 
 
+# Default reliability knobs shared by the TCP/UDP port scans. A single burst of
+# many probes loses replies (the receive path or the kernel's ICMP rate limiter
+# can't keep up), which reads back as "no open ports" on a wide range even though
+# the same ports scanned individually answer fine. So each port is probed up to
+# ``_DEFAULT_SCAN_RETRIES`` + 1 times (only the still-silent ports carry to the
+# next round), and a small inter-packet gap paces the send so the burst doesn't
+# outrun the reply path.
+_DEFAULT_SCAN_RETRIES = 2
+_DEFAULT_SCAN_INTER = 0.001
+
 # TCP header flag bits (RFC 793) used to classify a SYN-scan reply.
 _TCP_SYN = 0x02
 _TCP_RST = 0x04
@@ -179,7 +233,12 @@ _ICMP_FILTERED_CODES = {1, 2, 9, 10, 13}
 
 
 def tcp_syn_scan(
-    host: str, ports: list[int], *, timeout: float = 2.0
+    host: str,
+    ports: list[int],
+    *,
+    timeout: float = 2.0,
+    retries: int = _DEFAULT_SCAN_RETRIES,
+    inter: float = _DEFAULT_SCAN_INTER,
 ) -> dict[int, str]:
     """TCP SYN-scan one ``host`` across ``ports``; return ``{port: state}``.
 
@@ -190,32 +249,50 @@ def tcp_syn_scan(
     filtered). Unlike an ARP sweep this runs at layer 3, so it is *routed*: the
     egress interface is chosen by the routing table (there is no ``iface`` pin -
     scapy's L3 ``sr`` ignores it), and it can reach hosts beyond the local link.
-    Mirrors nmap's ``-sS`` SYN scan; the implementation is an original scapy
-    composition. Needs raw-socket access.
+
+    A SYN or its reply can be dropped when many probes go out at once, which would
+    silently miss an open port, so each port is probed up to ``retries`` + 1 times
+    and ``inter`` paces the send (see :data:`_DEFAULT_SCAN_RETRIES` /
+    :data:`_DEFAULT_SCAN_INTER`): every round re-probes only the ports still
+    without a definitive (open/closed/filtered) answer, and the loop stops early
+    once none remain. Mirrors nmap's ``-sS`` SYN scan; the implementation is an
+    original scapy composition. Needs raw-socket access.
     """
     if not ports:
         return {}
-    answered, _ = sr(
-        IP(dst=host) / TCP(dport=ports, flags="S"),
-        timeout=timeout,
-        verbose=False,
-    )
     states: dict[int, str] = {}
-    for sent, received in answered:
-        dport = int(sent[TCP].dport)
-        if received.haslayer(TCP):
-            flags = int(received[TCP].flags)
-            if (flags & _TCP_SYN_ACK) == _TCP_SYN_ACK:
-                states[dport] = "open"
-            elif flags & _TCP_RST:
-                states[dport] = "closed"
-        elif received.haslayer(ICMP) and int(received[ICMP].type) == _ICMP_UNREACHABLE:
-            states[dport] = "filtered"
+    remaining = list(dict.fromkeys(ports))
+    for _attempt in range(retries + 1):
+        if not remaining:
+            break
+        answered, _ = sr(
+            IP(dst=host) / TCP(dport=remaining, flags="S"),
+            timeout=timeout,
+            inter=inter,
+            verbose=False,
+        )
+        for sent, received in answered:
+            dport = int(sent[TCP].dport)
+            if received.haslayer(TCP):
+                flags = int(received[TCP].flags)
+                if (flags & _TCP_SYN_ACK) == _TCP_SYN_ACK:
+                    states[dport] = "open"
+                elif flags & _TCP_RST:
+                    states[dport] = "closed"
+            elif received.haslayer(ICMP) and int(received[ICMP].type) == _ICMP_UNREACHABLE:
+                states[dport] = "filtered"
+        # Only ports still without any answer are worth re-probing.
+        remaining = [port for port in remaining if port not in states]
     return states
 
 
 def udp_scan(
-    host: str, ports: list[int], *, timeout: float = 2.0
+    host: str,
+    ports: list[int],
+    *,
+    timeout: float = 2.0,
+    retries: int = _DEFAULT_SCAN_RETRIES,
+    inter: float = _DEFAULT_SCAN_INTER,
 ) -> dict[int, str]:
     """UDP-scan one ``host`` across ``ports``; return ``{port: state}``.
 
@@ -224,31 +301,44 @@ def udp_scan(
     ``"closed"``; another ICMP unreachable (admin/host/net-prohibited) means
     ``"filtered"``. Ports that never answer are *absent* - UDP silence is
     ambiguous (open or filtered), so the caller records those as
-    ``open|filtered``. Note that the kernel rate-limits outgoing ICMP errors, so
-    scanning many closed ports quickly can leave some looking unanswered. Runs at
-    layer 3 (routed, egress chosen by the routing table) and needs raw-socket
-    access.
+    ``open|filtered``.
+
+    The kernel rate-limits outgoing ICMP errors, so scanning many ports in one
+    burst leaves some closed ports looking unanswered (and an open service's lone
+    reply can itself be dropped). Each port is therefore probed up to ``retries``
+    + 1 times with an ``inter`` gap pacing the send (see
+    :data:`_DEFAULT_SCAN_RETRIES` / :data:`_DEFAULT_SCAN_INTER`): every round
+    re-probes only the ports still without a reply, so a definitive result has
+    several chances to arrive under the rate limiter. Runs at layer 3 (routed,
+    egress chosen by the routing table) and needs raw-socket access.
     """
     if not ports:
         return {}
-    answered, _ = sr(
-        IP(dst=host) / UDP(dport=ports),
-        timeout=timeout,
-        verbose=False,
-    )
     states: dict[int, str] = {}
-    for sent, received in answered:
-        dport = int(sent[UDP].dport)
-        if received.haslayer(UDP):
-            states[dport] = "open"
-        elif received.haslayer(ICMP):
-            icmp = received[ICMP]
-            if int(icmp.type) == _ICMP_UNREACHABLE:
-                code = int(icmp.code)
-                if code == _ICMP_PORT_UNREACHABLE:
-                    states[dport] = "closed"
-                elif code in _ICMP_FILTERED_CODES:
-                    states[dport] = "filtered"
+    remaining = list(dict.fromkeys(ports))
+    for _attempt in range(retries + 1):
+        if not remaining:
+            break
+        answered, _ = sr(
+            IP(dst=host) / UDP(dport=remaining),
+            timeout=timeout,
+            inter=inter,
+            verbose=False,
+        )
+        for sent, received in answered:
+            dport = int(sent[UDP].dport)
+            if received.haslayer(UDP):
+                states[dport] = "open"
+            elif received.haslayer(ICMP):
+                icmp = received[ICMP]
+                if int(icmp.type) == _ICMP_UNREACHABLE:
+                    code = int(icmp.code)
+                    if code == _ICMP_PORT_UNREACHABLE:
+                        states[dport] = "closed"
+                    elif code in _ICMP_FILTERED_CODES:
+                        states[dport] = "filtered"
+        # Silent ports (still ambiguous open|filtered) get another chance.
+        remaining = [port for port in remaining if port not in states]
     return states
 
 
@@ -261,6 +351,19 @@ def send(iface_name: str | None, packet: Packet, *, timeout: int = 5):
     """
     pkt = packet.build() if isinstance(packet, Packet) else packet
     return srp(pkt, iface=iface_name, threaded=False, timeout=timeout, verbose=False)
+
+
+def send_l2(frame, iface_name: str, *, count: int = 1) -> None:
+    """Fire-and-forget layer-2 injection: send ``frame`` and await no reply.
+
+    Unlike :func:`send` (which uses ``srp`` to send *and* receive), this is a
+    one-way ``sendp`` used to inject raw link-layer frames - e.g. 802.11
+    management frames on a monitor-mode interface, where no reply is expected.
+    ``frame`` is a fully-built scapy packet (already wrapped in its link layer,
+    such as ``RadioTap``); ``iface_name`` pins the send to that NIC. Verbose
+    output is suppressed so nothing lands on the interactive prompt.
+    """
+    _sendp(frame, iface=iface_name, count=count, verbose=False)
 
 
 def sniff(

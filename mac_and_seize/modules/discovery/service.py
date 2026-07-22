@@ -10,9 +10,15 @@ stays responsive; only one scan may run at a time.
 A scan target is either an **address spec** (IP, CIDR, last-octet range, or
 hostname) scanned via the default route, or the name of a **local interface**,
 in which case the subnet that NIC is on is scanned and the probes are pinned to
-that interface (so multi-homed hosts can scan the right link). See
-:meth:`_resolve_target`. ARP is not routed, so a scan only finds hosts on the
-local link; the whole target is swept in one batch.
+that interface (so multi-homed hosts can scan the right link), or the keyword
+``"discovered"`` to re-probe every host already in the store (a fast liveness
+recheck). See :meth:`_resolve_target`. ARP is not routed, so a scan only finds
+hosts on the local link; the whole target is swept in one batch.
+
+A completed host scan sets each host's ``state`` relative to that scan -
+``"up"`` (replied), ``"down"`` (in range but silent), or ``"N/A"`` (outside the
+scan's range) - and flags hosts it saw for the first time as new; see
+:meth:`_merge_scan_locked`.
 
 The probe is a pure-scapy ARP sweep inspired by nmap's ``-PR`` host discovery;
 none of nmap's code is used.
@@ -61,13 +67,15 @@ if TYPE_CHECKING:
     from mac_and_seize.core.context import AppContext
     from mac_and_seize.core.tasks import Task
 
-#: Default seconds to wait for ARP replies when the user gives no --timeout.
-#: A reply on the local link returns in well under a millisecond, so a short
-#: wait suffices - and it matters: scapy's sweep only ends early once *every*
-#: probe is answered, which never happens when the target range covers unused
-#: addresses, so it always blocks for the full timeout. Keeping this small is
-#: what keeps a subnet sweep fast.
-_DEFAULT_TIMEOUT = 0.5
+#: Default seconds to wait for ARP replies (per attempt) when the user gives no
+#: --timeout. A reply on the local link returns in well under a millisecond, but
+#: too short a wait misses hosts that are slow to answer (a busy or power-saving
+#: host, a loaded switch), and scapy's sweep only ends early once *every* probe
+#: is answered - which never happens when the target range covers unused
+#: addresses - so it always blocks for the full timeout. This is per attempt and
+#: :func:`~mac_and_seize.net.adapters.scapy_io.arp_probe` re-probes unanswered
+#: addresses (3 attempts total), so an unused address is waited on ~3x this.
+_DEFAULT_TIMEOUT = 1.0
 
 #: Source addresses that identify no real host (never treated as active).
 _NON_HOST_SOURCES = {"0.0.0.0", "::"}
@@ -190,6 +198,10 @@ class DiscoveryService:
         if timeout is not None and timeout <= 0:
             raise ValueError("--timeout must be a positive number of seconds.")
         wait = timeout or _DEFAULT_TIMEOUT
+        # Rebuild scapy's interface/route caches (stale since launch if the wire
+        # moved to another NIC), so the sweep leaves the link that is actually up
+        # now instead of a cached, now-dead one.
+        scapy_io.refresh_network_state()
         # Resolve up front (synchronously) so a bad interface / bad or oversized
         # address target fails now, before a background task is registered.
         iface, hosts = self._resolve_target(target)
@@ -224,13 +236,25 @@ class DiscoveryService:
     def _resolve_target(self, target: str) -> tuple[str | None, list[str]]:
         """Resolve a scan ``target`` to ``(iface, hosts)``.
 
-        If ``target`` names a local interface, scan the subnet(s) that NIC is on
-        and pin the probes to it (returned as ``iface``). Otherwise ``target``
-        is an address spec (IP, CIDR, last-octet range, or hostname) scanned via
-        scapy's default routing (``iface`` is ``None``). Raises
-        :class:`ValueError` for an interface with no IPv4 address or a malformed
-        address target.
+        The keyword ``"discovered"`` expands to every IP found so far (routed, so
+        ``iface`` is ``None``) - a quick way to re-probe the whole store and see
+        which hosts are still up. If ``target`` names a local interface, scan the
+        subnet(s) that NIC is on and pin the probes to it (returned as
+        ``iface``). Otherwise ``target`` is an address spec (IP, CIDR, last-octet
+        range, or hostname) scanned via scapy's default routing (``iface`` is
+        ``None``). Raises :class:`ValueError` for an interface with no IPv4
+        address or a malformed address target, and :class:`ModuleError` for
+        ``"discovered"`` with an empty store.
         """
+        if target.lower() == "discovered":
+            with self._lock:
+                hosts = sorted({host.ip for host in self._hosts.values()}, key=_ip_sort_key)
+            if not hosts:
+                raise ModuleError(
+                    "No hosts discovered yet to scan; run 'discovery scan' with an "
+                    "explicit target first."
+                )
+            return None, hosts
         if target in netifaces_io.list_names():
             networks = netifaces_io.ipv4_networks(target)
             if not networks:
@@ -319,7 +343,7 @@ class DiscoveryService:
             if self._run is run:
                 self._run = None
             if not cancelled and error is None:
-                found_count = self._merge_locked(replies)
+                found_count = self._merge_scan_locked(set(hosts), replies)
 
         run.context.tasks.finish(run.task)  # idempotent; cancel may already have
 
@@ -337,11 +361,16 @@ class DiscoveryService:
     def _merge_locked(self, replies: dict[str, tuple[str | None, str]]) -> int:
         """Merge a completed sweep's replies into the store. Caller holds ``_lock``.
 
-        Preserves an already-known host's open ports (and doesn't wipe a known
-        MAC with a reply that carries none), since host discovery and port scans
-        share the one store.
+        Every replying host is recorded ``"up"`` and flagged ``is_new`` when this
+        is the first time the store has seen its address. Preserves an
+        already-known host's open ports (and doesn't wipe a known MAC with a reply
+        that carries none), since host discovery and port scans share the one
+        store. This only *adds* liveness for hosts that answered - re-evaluating
+        the hosts that stayed silent (``down``/``N/A``) is the host scan's job, in
+        :meth:`_merge_scan_locked`.
         """
         now = datetime.now(timezone.utc)
+        prev_ips = set(self._hosts)
         for ip, (mac, method) in replies.items():
             existing = self._hosts.get(ip)
             mac = mac or (existing.mac if existing else None)
@@ -354,8 +383,37 @@ class DiscoveryService:
                 first_seen=existing.first_seen if existing else now,
                 last_seen=now,
                 ports=existing.ports if existing else {},
+                is_new=ip not in prev_ips,
             )
         return len(replies)
+
+    def _merge_scan_locked(
+        self, scanned: set[str], replies: dict[str, tuple[str | None, str]]
+    ) -> int:
+        """Merge a host sweep and re-evaluate every host's liveness. Holds ``_lock``.
+
+        The host scan is the authority on liveness, so it (re)sets the ``state``
+        of *every* host in the store relative to the range it just covered:
+
+        * a host that replied is ``"up"`` (and ``is_new`` if this scan first found
+          it) - folded in by :meth:`_merge_locked`;
+        * a host already known whose address was in ``scanned`` but stayed silent
+          is ``"down"``;
+        * a host whose address was not in ``scanned`` is ``"N/A"`` (its liveness
+          is unknown after a scan that never probed it).
+
+        ``is_new`` is cleared on every host that did not just reply, so the ``*``
+        prefix only ever marks the most recent scan's fresh finds. Returns the
+        number of hosts that replied.
+        """
+        found = self._merge_locked(replies)
+        replied = set(replies)
+        for ip, host in self._hosts.items():
+            if ip in replied:
+                continue
+            host.is_new = False
+            host.state = "down" if ip in scanned else "N/A"
+        return found
 
     # --- Import from capture ----------------------------------------------------
 
@@ -405,10 +463,15 @@ class DiscoveryService:
             return count
 
     def list_rows(self) -> list[dict]:
-        """Rows for ``discovery list``: ip, mac, and open ports (no vendor)."""
+        """Rows for ``discovery list``: ip, state, mac, and open ports (no vendor)."""
         with self._lock:
             return [
-                {"ip": row["ip"], "mac": row["mac"], "ports": row["ports"]}
+                {
+                    "ip": row["ip"],
+                    "state": row["state"],
+                    "mac": row["mac"],
+                    "ports": row["ports"],
+                }
                 for row in host_rows(self._hosts.values())
             ]
 
@@ -476,9 +539,12 @@ class DiscoveryService:
             raise ValueError("--timeout must be a positive number of seconds.")
         wait = timeout or _DEFAULT_SERVICE_TIMEOUT
         ports = self._parse_ports(port or _DEFAULT_PORTS)
+        # Rebuild scapy's interface/route caches (stale since launch if the wire
+        # moved to another NIC), so probes leave the link that is actually up now.
+        scapy_io.refresh_network_state()
         # Resolve up front (synchronously) so a bad target / empty 'discovered'
         # store / oversized scan fails now, before a background task is registered.
-        iface, hosts = self._resolve_service_target(target)
+        iface, hosts = self._resolve_target(target)
         if not hosts:
             raise ValueError(f"Target {target!r} expands to no hosts to scan.")
         total = len(hosts) * len(ports)
@@ -515,23 +581,6 @@ class DiscoveryService:
             f"({len(hosts)} host(s) x {len(ports)} port(s))."
         )
 
-    def _resolve_service_target(self, target: str) -> tuple[str | None, list[str]]:
-        """Resolve a service-scan ``target`` to ``(iface, hosts)``.
-
-        Adds the ``"discovered"`` keyword to the host-scan target forms: it scans
-        every IP found by host discovery so far (routed, so ``iface`` is
-        ``None``). Everything else defers to :meth:`_resolve_target`.
-        """
-        if target.lower() == "discovered":
-            with self._lock:
-                hosts = sorted({host.ip for host in self._hosts.values()}, key=_ip_sort_key)
-            if not hosts:
-                raise ModuleError(
-                    "No hosts discovered yet to scan; run 'discovery scan' first "
-                    "(or give an explicit target)."
-                )
-            return None, hosts
-        return self._resolve_target(target)
 
     @staticmethod
     def _parse_ports(spec: str) -> list[int]:
@@ -686,7 +735,7 @@ class DiscoveryService:
             if host is None:
                 host = Host(
                     ip=ip, mac=None, vendor=None, state="up", method="port",
-                    first_seen=now, last_seen=now,
+                    first_seen=now, last_seen=now, is_new=True,
                 )
                 self._hosts[ip] = host
             existing = host.ports.get((proto, port))

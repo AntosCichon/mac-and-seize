@@ -29,9 +29,11 @@ GROUP_DESCRIPTIONS = {
 }
 
 # Column layout for the interactive `discovery inspect` table; the free-text
-# columns (vendor, ports) flex to fill the terminal.
+# columns (vendor, ports) flex to fill the terminal. The ip column is a touch
+# wider than an address to fit the leading `*` a newly-found host carries.
 _INSPECT_COLUMNS = [
-    Column("ip", "ip", 16),
+    Column("ip", "ip", 17),
+    Column("state", "state", 6),
     Column("mac", "mac", 18),
     Column("vendor", "vendor", 16, flex=True),
     Column("ports", "ports", 30, flex=True),
@@ -102,25 +104,29 @@ def build_actions() -> list[Action]:
             "Scan for hosts",
             "Start a background host-discovery sweep (a pure-scapy ARP sweep - no "
             "external nmap binary) against a target: a single IP, CIDR "
-            "(192.168.1.0/24), last-octet range (192.168.1.10-20), hostname, or "
+            "(192.168.1.0/24), last-octet range (192.168.1.10-20), hostname, "
             "the name of a local interface (e.g. eth0) to scan the subnet that "
-            "NIC is on. For a CIDR the network and broadcast addresses are "
-            "skipped. ARP is not routed, so only hosts on the local link are "
-            "found. The prompt stays usable while it runs and a line announces "
-            "completion regardless of your current context; results appear in "
-            "'discovery list' and 'discovery inspect'. Cancelling is instant "
-            "('discovery cancel'). The sweep mirrors nmap's -PR host discovery "
-            "(requires root).",
+            "NIC is on, or the keyword 'discovered' to re-probe every host found "
+            "so far (a quick liveness recheck). For a CIDR the network and "
+            "broadcast addresses are skipped. ARP is not routed, so only hosts on "
+            "the local link are found. Each host's 'state' column reflects the "
+            "most recent scan - up (replied), down (in range but silent), or N/A "
+            "(outside this scan's range) - and a host first seen by the latest "
+            "scan is marked with a '*' before its address. The prompt stays usable "
+            "while it runs and a line announces completion regardless of your "
+            "current context; results appear in 'discovery list' and 'discovery "
+            "inspect'. Cancelling is instant ('discovery cancel'). The sweep "
+            "mirrors nmap's -PR host discovery (requires root).",
             _scan,
             [
                 Param(
                     "target",
-                    "Scan target: IP, CIDR, last-octet range, hostname, or a "
-                    "local interface name (scans that NIC's subnet)",
+                    "Scan target: IP, CIDR, last-octet range, hostname, a local "
+                    "interface name (scans that NIC's subnet), or 'discovered'",
                 ),
                 Param(
                     "timeout",
-                    "Seconds to wait for ARP replies (default: 0.5)",
+                    "Seconds to wait for ARP replies (default: 1)",
                     float,
                     required=False,
                 ),
@@ -130,6 +136,7 @@ def build_actions() -> list[Action]:
                 "discovery scan 192.168.1.10-20",
                 "discovery scan 192.168.1.1 --timeout 2",
                 "discovery scan eth0",
+                "discovery scan discovered",
             ],
             requires_root=True,
         ),
@@ -233,9 +240,11 @@ def build_actions() -> list[Action]:
         Action(
             "discovery.inspect",
             "Inspect discovered hosts",
-            "Open a scrollable, read-only table of discovered hosts (ip, mac, "
-            "vendor, and its open ports). Navigate with the arrow keys; press "
-            "Esc, Enter or q to exit.",
+            "Open a scrollable, read-only table of discovered hosts (ip, state, "
+            "mac, vendor, and its open ports). 'state' is liveness versus the "
+            "most recent scan - up/down/N/A - and a '*' before an address marks a "
+            "host that scan found for the first time. Navigate with the arrow "
+            "keys; press Esc, Enter or q to exit.",
             _inspect,
             examples=["discovery inspect"],
         ),
@@ -243,8 +252,10 @@ def build_actions() -> list[Action]:
             "discovery.list",
             "List discovered hosts",
             "List hosts discovered so far this session, one row per host (ip, "
-            "mac, and its open ports as a 'port/proto' list - a trailing '?' "
-            "marks a UDP open|filtered port).",
+            "state, mac, and its open ports as a 'port/proto' list - a trailing "
+            "'?' marks a UDP open|filtered port). 'state' is liveness versus the "
+            "most recent scan (up/down/N/A) and a '*' before an address marks a "
+            "host that scan first found.",
             _list,
             examples=["discovery list"],
         ),

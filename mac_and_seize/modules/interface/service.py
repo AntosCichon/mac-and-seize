@@ -73,7 +73,12 @@ class InterfaceService:
         previous = ip.read_state(name)
         if previous != state:
             ip.set_link_state(name, state)
-        iface.state = ip.read_state(name)
+            # operstate lags the admin change (the link is briefly still "down"
+            # while the carrier comes up), so poll until it settles instead of
+            # reading it immediately and reporting a stale "down".
+            iface.state = ip.wait_for_state(name, state)
+        else:
+            iface.state = ip.read_state(name)
         self._log.info(
             "Interface %s state change requested: %s -> %s (now %s)",
             name,

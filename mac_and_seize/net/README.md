@@ -27,10 +27,10 @@ net/
     packet.py      Packet                          (scapy wrapper + factories + inspection)
   adapters/     infrastructure — the only place OS/scapy calls live
     privileged.py  run(), PrivilegedCommandError, family_flag()
-    ip.py          link/addr/route ops via `ip`, + sysfs read_state/is_up
+    ip.py          link/addr/route ops via `ip`, + sysfs read_state/is_up/wait_for_state
     ethtool.py     get_permanent_mac() via SIOCETHTOOL ioctl
     netifaces_io.py list_names(), read_addresses()
-    scapy_io.py    send(), sniff(), write/read_pcap(), available_interfaces(), refresh_interfaces(), expand_hosts(), arp_probe()
+    scapy_io.py    send(), sniff(), write/read_pcap(), available_interfaces(), refresh_interfaces(), refresh_network_state(), expand_hosts(), arp_probe()
     wireless.py    is_wireless/set_mode/set_channel(verified)/current_*, ieee/validate_channels,
                    PHY topology (list_phys/phy_of/interfaces_on_phy), add_monitor/del_interface,
                    interfering_daemons  (nl80211 via PyRIC)

@@ -34,7 +34,20 @@ class Port:
 
 @dataclass
 class Host:
-    """One discovered host, keyed by IP in the single discovery store."""
+    """One discovered host, keyed by IP in the single discovery store.
+
+    ``state`` is the host's liveness *relative to the most recent host scan*
+    (see :meth:`~mac_and_seize.modules.discovery.service.DiscoveryService._merge_scan_locked`):
+
+    * ``"up"`` - replied to the most recent scan;
+    * ``"down"`` - was already known and its address was in the most recent
+      scan's range, but it did not reply;
+    * ``"N/A"`` - was already known but its address was not in the most recent
+      scan's range, so its current liveness is unknown.
+
+    ``is_new`` marks a host first discovered by the most recent scan (shown with
+    a ``*`` prefix on its address); the scan clears it on every other host.
+    """
 
     ip: str
     mac: str | None
@@ -45,6 +58,8 @@ class Host:
     last_seen: datetime
     #: Open ports found on this host by a scan, keyed by ``(proto, port)``.
     ports: dict[tuple[str, int], Port] = field(default_factory=dict)
+    #: First seen by the most recent scan (rendered with a ``*`` address prefix).
+    is_new: bool = False
 
 
 def _ip_sort_key(ip: str) -> tuple:
@@ -80,15 +95,19 @@ def format_ports(ports: dict[tuple[str, int], Port]) -> str:
 def host_rows(hosts: Iterable[Host]) -> list[dict]:
     """Render the store as full display rows, one per host, ordered by IP.
 
-    Each row is ``{ip, mac, vendor, ports}``, folding the host's open ports into
-    a single ``ports`` column (see :func:`format_ports`). ``discovery inspect``
-    shows these as-is; ``discovery list`` shows a subset (see
+    Each row is ``{ip, state, mac, vendor, ports}``, folding the host's open
+    ports into a single ``ports`` column (see :func:`format_ports`). ``state`` is
+    the host's liveness versus the most recent scan (``up``/``down``/``N/A``; see
+    :class:`Host`), and a host first found by that scan is flagged with a ``*``
+    prefix on its address. ``discovery inspect`` shows these as-is; ``discovery
+    list`` shows a subset (see
     :meth:`~mac_and_seize.modules.discovery.service.DiscoveryService.list_rows`).
     """
     ordered = sorted(hosts, key=lambda host: _ip_sort_key(host.ip))
     return [
         {
-            "ip": host.ip,
+            "ip": f"*{host.ip}" if host.is_new else host.ip,
+            "state": host.state,
             "mac": host.mac or "-",
             "vendor": host.vendor or "-",
             "ports": format_ports(host.ports),

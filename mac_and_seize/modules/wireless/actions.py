@@ -9,10 +9,11 @@ preservation. Channel selection lives entirely in ``--sweep``.
 
 * ``capture`` - start/stop plus inspect/networks/stations/summary/clear/
   export/import and a ``filter`` subgroup;
-* ``activity`` - rank channels by traffic to choose a ``--sweep``.
+* ``activity`` - rank channels by traffic to choose a ``--sweep``;
+* ``beacon`` - flood fake-AP beacon frames (``spam`` / ``stop``).
 
-Handlers stay thin. Attack tooling (deauth, handshake capture, ...) is planned to
-land as further top-level ``wireless`` subgroups.
+Handlers stay thin. Further attack tooling (deauth, handshake capture, ...) is
+planned to land as more ``wireless`` subgroups.
 """
 
 from __future__ import annotations
@@ -26,9 +27,11 @@ from mac_and_seize.modules.wireless.filters import FIELDS
 
 if TYPE_CHECKING:
     from mac_and_seize.core.context import AppContext
+    from mac_and_seize.modules.wireless.beacon import BeaconService
     from mac_and_seize.modules.wireless.capture import WirelessCaptureService
 
 WIRELESS_CAPTURE_SERVICE = "wireless_capture"
+WIRELESS_BEACON_SERVICE = "wireless_beacon"
 
 # Column layout for the `wireless capture inspect` table; addresses/SSID flex.
 _INSPECT_COLUMNS = [
@@ -44,11 +47,16 @@ WIRELESS_GROUP_DESCRIPTIONS = {
     "wireless": "Capture and manipulate 802.11 (Wi-Fi) traffic in monitor mode",
     "wireless.capture": "Capture and inspect 802.11 frames",
     "wireless.capture.filter": "Manage 802.11 include/exclude filters",
+    "wireless.beacon": "Flood fake-AP 802.11 beacon frames (authorized testing)",
 }
 
 
 def _capture(context: "AppContext") -> "WirelessCaptureService":
     return context.service(WIRELESS_CAPTURE_SERVICE)  # type: ignore[return-value]
+
+
+def _beacon(context: "AppContext") -> "BeaconService":
+    return context.service(WIRELESS_BEACON_SERVICE)  # type: ignore[return-value]
 
 
 def _start(context: "AppContext", values: dict) -> str:
@@ -155,6 +163,23 @@ def _filter_show(context: "AppContext", values: dict):
     if not filters:
         return "No filters defined. Every 802.11 frame is captured."
     return filters
+
+
+def _beacon_spam(context: "AppContext", values: dict) -> str:
+    # ``bssid`` is a `multiple` param, so the CLI fans out and calls this once per
+    # network name - each becomes its own background job.
+    return _beacon(context).spam(
+        context, values["bssid"], duration=values.get("duration")
+    )
+
+
+def _beacon_stop(context: "AppContext", values: dict) -> str:
+    # Also fanned out per name; the sentinel 'all' stops every running job.
+    name = values["bssid"]
+    service = _beacon(context)
+    if str(name).strip().lower() == "all":
+        return service.stop_all()
+    return service.stop(name)
 
 
 def build_wireless_actions() -> list[Action]:
@@ -338,5 +363,50 @@ def build_wireless_actions() -> list[Action]:
             "List all defined wireless filters with their ids so they can be removed.",
             _filter_show,
             examples=["wireless capture filter show"],
+        ),
+        Action(
+            "wireless.beacon.spam",
+            "Spam 802.11 beacons",
+            "Flood IEEE 802.11 beacon frames advertising one or more network names "
+            "(SSIDs), each frame sent from a fresh randomized (bogus) BSSID/source "
+            "address, so scanners see a stream of phantom access points (requires "
+            "root). Every name starts its own background job - pass a comma list to "
+            "spam several at once - and each can be stopped independently with "
+            "'wireless beacon stop <name>'. The radio is put into monitor mode "
+            "automatically on the first job and restored when the last one stops; "
+            "while spamming, that interface has no network connectivity. --duration "
+            "stops each job automatically after N seconds (reported when it elapses). "
+            "The prompt stays usable while it runs. For authorized wireless security "
+            "testing only.",
+            _beacon_spam,
+            [
+                Param("bssid", "Network name(s) to advertise (SSID); comma list spams several",
+                      multiple=True),
+                Param("duration", "Stop each job automatically after N seconds", int,
+                      required=False),
+            ],
+            [
+                "wireless beacon spam FreeWiFi",
+                "wireless beacon spam FreeWiFi,Corp-Guest",
+                "wireless beacon spam FreeWiFi --duration 60",
+            ],
+            requires_root=True,
+        ),
+        Action(
+            "wireless.beacon.stop",
+            "Stop 802.11 beacon spam",
+            "Stop running beacon-spam jobs by the network name they advertise. Pass "
+            "a single name, a comma list to stop several, or 'all' to stop every "
+            "job. When the last job stops, the radio is restored to how it was found "
+            "(requires root). Use the top-level 'tasks' command to see what is "
+            "running.",
+            _beacon_stop,
+            [Param("bssid", "Network name(s) whose spam to stop, or 'all'", multiple=True)],
+            [
+                "wireless beacon stop FreeWiFi",
+                "wireless beacon stop FreeWiFi,Corp-Guest",
+                "wireless beacon stop all",
+            ],
+            requires_root=True,
         ),
     ]

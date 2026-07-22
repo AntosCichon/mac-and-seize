@@ -12,6 +12,7 @@ layer is already validated. Linux-specific, matching the rest of the app.
 from __future__ import annotations
 
 import json
+import time
 
 from mac_and_seize.net.adapters.privileged import (
     PrivilegedCommandError,
@@ -40,6 +41,36 @@ def read_state(name: str) -> str:
     """Return the interface's operational state (from sysfs ``operstate``)."""
     with open(f"/sys/class/net/{name}/operstate") as f:
         return f.read().strip()
+
+
+# operstate values that count as a *settled* result for an ``up`` request. A NIC
+# that supports carrier detection reports ``"up"`` once the link is ready; many
+# virtual/tunnel/wifi devices never report ``"up"`` and sit at ``"unknown"`` (or
+# briefly ``"dormant"`` during 802.1X), so those count as settled too - otherwise
+# we would always wait out the whole timeout for such an interface.
+_UP_SETTLED = frozenset({"up", "unknown", "dormant"})
+
+
+def wait_for_state(
+    name: str, state: str, *, timeout: float = 4.0, interval: float = 0.1
+) -> str:
+    """Poll ``operstate`` after a link change until it settles; return the state.
+
+    Bringing a link administratively ``up`` does not update ``operstate``
+    instantly: for a moment the kernel still reports ``"down"`` while the driver
+    and carrier come up, so reading it right after ``ip link set ... up`` can
+    wrongly show the interface as down. Poll until ``operstate`` reflects the
+    requested ``state`` (a terminal state for it) or ``timeout`` seconds elapse,
+    then return whatever ``operstate`` reads - so a genuinely carrierless
+    interface still resolves to its real (down) state rather than hanging.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        current = read_state(name)
+        settled = current in _UP_SETTLED if state == "up" else current == "down"
+        if settled or time.monotonic() >= deadline:
+            return current
+        time.sleep(interval)
 
 
 def is_up(name: str) -> bool:
