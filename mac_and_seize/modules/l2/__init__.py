@@ -2,9 +2,10 @@
 
 Auto-discovered via :func:`register`. Unlike a flat feature module, ``l2`` is an
 umbrella over several layer-2 areas, each in its own sub-package: ``mac`` (CAM/
-MAC-table saturation - the ``flood`` / ``stop`` commands) plus ``arp``, ``dhcp``
-and ``vlan`` skeletons that will grow their own commands later. ``register()``
-aggregates each area's services, actions and group descriptions into one
+MAC-table saturation - the ``flood`` / ``stop`` commands), ``arp`` (ARP cache
+poisoning - the ``spoof`` / ``stop`` commands) plus ``dhcp`` and ``vlan``
+skeletons that will grow their own commands later. ``register()`` aggregates
+each area's services, actions and group descriptions into one
 :class:`~mac_and_seize.core.plugins.ModuleSpec`, so implementing an area later is
 just filling in its sub-package - it is already listed here.
 
@@ -27,7 +28,7 @@ def register() -> ModuleSpec:
     services: dict = {}
     actions: list = []
     group_descriptions: dict = {
-        "l2": "Layer-2 network automations (authorized testing)",
+        "l2": "Layer-2 network automations",
     }
     for area in _AREAS:
         services.update(getattr(area, "SERVICES", {}))

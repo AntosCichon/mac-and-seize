@@ -1,23 +1,27 @@
-"""ARP automations (not implemented yet).
+"""ARP-layer automations: ARP cache poisoning via forged ARP replies.
 
-Skeleton area of the :mod:`mac_and_seize.modules.l2` module. It contributes no
-commands yet - only a staged group description that activates once actions are
-added here. To implement it, mirror the ``mac`` area: add ``service.py`` /
-``actions.py`` and return the actions from :func:`build_actions` (and populate
-``SERVICES`` if the area needs a session-scoped service).
+Exposes the ``l2 arp`` command surface (``spoof`` / ``stop``) and the
+session-scoped :class:`~mac_and_seize.modules.l2.arp.service.ArpSpoofService`.
+The parent :mod:`mac_and_seize.modules.l2` package aggregates the names below
+into the module's :class:`~mac_and_seize.core.plugins.ModuleSpec`.
 """
 
 from __future__ import annotations
 
-#: Service key -> zero-arg factory. None yet.
-SERVICES: dict = {}
+from mac_and_seize.modules.l2.arp.actions import (
+    GROUP_DESCRIPTIONS,
+    SERVICE,
+    build_actions,
+)
+from mac_and_seize.modules.l2.arp.service import ArpSpoofService
 
-#: Staged label; the ``l2 arp`` group appears once this area has commands.
-GROUP_DESCRIPTIONS = {
-    "l2.arp": "ARP automations (not implemented yet)",
-}
+#: Service key -> factory, merged into the module's services by ``l2.register()``.
+SERVICES = {SERVICE: ArpSpoofService}
 
-
-def build_actions() -> list:
-    """No commands yet; see the module docstring to implement this area."""
-    return []
+__all__ = [
+    "GROUP_DESCRIPTIONS",
+    "SERVICE",
+    "SERVICES",
+    "ArpSpoofService",
+    "build_actions",
+]
