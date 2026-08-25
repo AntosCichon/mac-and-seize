@@ -327,7 +327,7 @@ class ArpSpoofService:
             job.thread = threading.Thread(
                 target=self._run,
                 args=(job,),
-                name=f"l2-arp-spoof-{method}-{iface}-{spoofed_ip}",
+                name=f"lan-arp-spoof-{method}-{iface}-{spoofed_ip}",
                 daemon=True,
             )
             job.task = context.tasks.start(
@@ -341,13 +341,13 @@ class ArpSpoofService:
             return (
                 f"ARP spoof started on {iface} (reply): telling {len(sends)} "
                 f"target(s) that {spoofed_ip} is at {spoofer_mac}. "
-                f"Stop every running spoof with 'l2 arp stop'."
+                f"Stop every running spoof with 'lan arp stop'."
             )
         return (
             f"ARP spoof started on {iface} (gratuitous): announcing "
             f"{spoofed_ip} is at {spoofer_mac} to {len(sends)} subnet(s) "
             f"via directed broadcast. "
-            f"Stop every running spoof with 'l2 arp stop'."
+            f"Stop every running spoof with 'lan arp stop'."
         )
 
     def stop_all(self) -> str:

@@ -23,7 +23,12 @@ import sys
 import threading
 from typing import Callable
 
-from mac_and_seize.core.presenter import BuiltLayer, Column, LayerType
+from mac_and_seize.core.presenter import (
+    ROW_STYLE_KEY,
+    BuiltLayer,
+    Column,
+    LayerType,
+)
 from mac_and_seize.core.errors import ModuleError
 from mac_and_seize.util.static import COLORS
 
@@ -293,12 +298,50 @@ def _layout(columns: list[Column], total_width: int) -> list[tuple[str, str, int
     return [(c.key, c.label, per_flex if c.flex else c.width) for c in columns]
 
 
+#: Foreground colour per :data:`~mac_and_seize.core.presenter.ROW_STYLES` name
+#: that needs a colour pair. ``"dim"`` is a plain attribute, so it is handled in
+#: :func:`_row_styles` rather than here.
+_STYLE_COLORS = {
+    "red": curses.COLOR_RED,
+    "green": curses.COLOR_GREEN,
+    "yellow": curses.COLOR_YELLOW,
+    "cyan": curses.COLOR_CYAN,
+}
+
+
+def _row_styles() -> dict[str, int]:
+    """Map each row-style name to a curses attribute for the current terminal.
+
+    Colour pairs can only be allocated once curses is initialised, so this runs
+    inside the wrapper rather than at import. A terminal without colour (or one
+    that refuses a pair) simply yields fewer entries: an unmapped style falls
+    back to ``A_NORMAL`` at draw time, which is why a row must never rely on
+    colour alone to convey its meaning (see ``core/presenter.py``).
+    """
+    styles = {"dim": curses.A_DIM}
+    try:
+        if not curses.has_colors():
+            return styles
+        curses.start_color()
+        curses.use_default_colors()  # -1 keeps the terminal's own background
+    except curses.error:
+        return styles
+    for index, (name, color) in enumerate(_STYLE_COLORS.items(), start=1):
+        try:
+            curses.init_pair(index, color, -1)
+        except curses.error:  # ran out of pairs on a limited terminal
+            continue
+        styles[name] = curses.color_pair(index)
+    return styles
+
+
 def _loop(stdscr, rows: list[dict], columns: list[Column], title: str) -> None:
     try:
         curses.curs_set(0)
     except curses.error:  # some terminals don't support hiding the cursor
         pass
     stdscr.keypad(True)
+    styles = _row_styles()
     selected = 0
     top = 0
 
@@ -325,7 +368,11 @@ def _loop(stdscr, rows: list[dict], columns: list[Column], title: str) -> None:
                 break
             row = rows[index]
             line = " ".join(_fit(row.get(key, "-"), w) for key, _, w in layout)
-            attr = curses.A_REVERSE if index == selected else curses.A_NORMAL
+            # The row's own style tints the whole line; the selection highlight
+            # is layered on top so the cursor stays visible over any colour.
+            attr = styles.get(row.get(ROW_STYLE_KEY), curses.A_NORMAL)
+            if index == selected:
+                attr |= curses.A_REVERSE
             _safe_addstr(stdscr, 2 + offset, 0, line.ljust(width), attr)
 
         footer = f" {selected + 1}/{len(rows)}"

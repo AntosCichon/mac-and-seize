@@ -22,6 +22,22 @@ from mac_and_seize.observability import get_logger
 
 _log = get_logger(__name__)
 
+#: Reserved key a table row may carry to request a per-row style, e.g.
+#: ``{"ip": "192.168.1.50", "state": "free", ROW_STYLE_KEY: "dim"}``. Its value
+#: is one of :data:`ROW_STYLES`. The key is *not* rendered as a column - both
+#: the plain ``list[dict]`` tables and :meth:`Presenter.table` skip it - so a
+#: module can add it to rows without changing their column layout.
+#:
+#: Styling is an *accent*, never the only carrier of meaning: a front-end whose
+#: medium has no colour (a pipe, a log file, a monochrome terminal) drops it
+#: silently, so rows must still say what they mean in their own text.
+ROW_STYLE_KEY = "_style"
+
+#: The style names a row may request under :data:`ROW_STYLE_KEY`. Front-ends map
+#: these onto whatever their medium offers (an ANSI style, a curses colour pair)
+#: and ignore any name they don't recognise.
+ROW_STYLES = ("dim", "red", "green", "yellow", "cyan")
+
 
 @dataclass(frozen=True)
 class Column:
@@ -82,7 +98,12 @@ class Presenter(Protocol):
     """A front-end's interactive-rendering capability."""
 
     def table(self, rows: list[dict], columns: list[Column], *, title: str) -> None:
-        """Display ``rows`` as an interactive, scrollable table."""
+        """Display ``rows`` as an interactive, scrollable table.
+
+        A row may carry :data:`ROW_STYLE_KEY` to request one of
+        :data:`ROW_STYLES` for its whole line; front-ends that cannot colour
+        ignore it.
+        """
         ...
 
     def build_packet(

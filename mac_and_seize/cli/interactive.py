@@ -48,6 +48,7 @@ from mac_and_seize.cli.tui import PromptAwareLogHandler, PromptAwareStream
 from mac_and_seize.core.actions import Action
 from mac_and_seize.core.context import AppContext
 from mac_and_seize.core.errors import ModuleError
+from mac_and_seize.core.presenter import ROW_STYLE_KEY
 from mac_and_seize.observability import LOGGER_NAME, get_logger
 from mac_and_seize.util.static import COLORS
 from mac_and_seize.util.system import is_root, relaunch_as_root
@@ -901,12 +902,17 @@ def _render(result) -> None:
         return
     if isinstance(result, list):
         if result and all(isinstance(item, dict) for item in result):
-            columns = list(result[0].keys())
+            # ROW_STYLE_KEY is a per-row styling hint, not data - it must not
+            # become a column of its own (see core/presenter.py).
+            columns = [key for key in result[0] if key != ROW_STYLE_KEY]
             table = Table()
             for column in columns:
                 table.add_column(column, style="cyan" if column == "name" else None)
             for row in result:
-                table.add_row(*[str(row.get(column, "")) for column in columns])
+                table.add_row(
+                    *[str(row.get(column, "")) for column in columns],
+                    style=row.get(ROW_STYLE_KEY),
+                )
             console.print(table)
         else:
             for index, item in enumerate(result, start=1):

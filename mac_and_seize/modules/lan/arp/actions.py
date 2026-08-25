@@ -1,10 +1,10 @@
-"""Actions for the ``l2 arp`` command group (ARP cache poisoning).
+"""Actions for the ``lan arp`` command group (ARP cache poisoning).
 
 Two commands, both root-only: ``spoof`` starts a background job that
 continuously injects forged ARP replies claiming a given IP is at a given MAC,
 and ``stop`` ends every running spoof job. Handlers stay thin - they translate
 parsed values into calls on the session-scoped
-:class:`~mac_and_seize.modules.l2.arp.service.ArpSpoofService`.
+:class:`~mac_and_seize.modules.lan.arp.service.ArpSpoofService`.
 """
 
 from __future__ import annotations
@@ -15,12 +15,12 @@ from mac_and_seize.core.actions import Action, Param
 
 if TYPE_CHECKING:
     from mac_and_seize.core.context import AppContext
-    from mac_and_seize.modules.l2.arp.service import ArpSpoofService
+    from mac_and_seize.modules.lan.arp.service import ArpSpoofService
 
-SERVICE = "l2_arp"
+SERVICE = "lan_arp"
 
 GROUP_DESCRIPTIONS = {
-    "l2.arp": "ARP-layer automations (ARP cache poisoning)",
+    "lan.arp": "ARP-layer automations (ARP cache poisoning)",
 }
 
 
@@ -46,7 +46,7 @@ def _stop(context: "AppContext", values: dict) -> str:
 def build_actions() -> list[Action]:
     return [
         Action(
-            "l2.arp.spoof",
+            "lan.arp.spoof",
             "Spoof ARP replies",
             "Continuously send forged ARP frames claiming that <ip> is at "
             "<mac>, so target hosts update their ARP caches and redirect "
@@ -65,7 +65,7 @@ def build_actions() -> list[Action]:
             "(gratuitous mode groups those addresses into /24 subnets to "
             "compute the broadcast pdst per subnet). The job runs in the "
             "background and the prompt stays usable; stop every running "
-            "spoof with 'l2 arp stop'. Use the top-level 'tasks' command to "
+            "spoof with 'lan arp stop'. Use the top-level 'tasks' command to "
             "see what is running. Several spoofs can run at once as long as "
             "they claim different (interface, ip) pairs. For authorized "
             "security testing only.",
@@ -87,15 +87,15 @@ def build_actions() -> list[Action]:
                 ),
             ],
             [
-                "l2 arp spoof eth0 192.168.1.1 aa:bb:cc:dd:ee:ff reply --target 192.168.1.100",
-                "l2 arp spoof eth0 192.168.1.1 aa:bb:cc:dd:ee:ff reply --target 192.168.1.10-20",
-                "l2 arp spoof eth0 192.168.1.1 aa:bb:cc:dd:ee:ff gratuitous --target 192.168.1.0/24",
-                "l2 arp spoof eth0 192.168.1.1 aa:bb:cc:dd:ee:ff gratuitous --target discovered",
+                "lan arp spoof eth0 192.168.1.1 aa:bb:cc:dd:ee:ff reply --target 192.168.1.100",
+                "lan arp spoof eth0 192.168.1.1 aa:bb:cc:dd:ee:ff reply --target 192.168.1.10-20",
+                "lan arp spoof eth0 192.168.1.1 aa:bb:cc:dd:ee:ff gratuitous --target 192.168.1.0/24",
+                "lan arp spoof eth0 192.168.1.1 aa:bb:cc:dd:ee:ff gratuitous --target discovered",
             ],
             requires_root=True,
         ),
         Action(
-            "l2.arp.stop",
+            "lan.arp.stop",
             "Stop all ARP spoofs",
             "Stop every running ARP spoof job and report how many reply frames "
             "were sent in total (requires root). There is no per-job stop "
@@ -103,7 +103,7 @@ def build_actions() -> list[Action]:
             "individual job identities.",
             _stop,
             [],
-            ["l2 arp stop"],
+            ["lan arp stop"],
             requires_root=True,
         ),
     ]

@@ -129,7 +129,7 @@ class MacFloodService:
             job.thread = threading.Thread(
                 target=self._run,
                 args=(job,),
-                name=f"l2-mac-flood-{iface}",
+                name=f"lan-mac-flood-{iface}",
                 daemon=True,
             )
             job.task = context.tasks.start(
@@ -142,7 +142,7 @@ class MacFloodService:
         limit = f", stopping after {int(duration)}s" if duration else ""
         return (
             f"MAC flood started on {iface} (randomized source MAC per frame)"
-            f"{limit}. Stop it with 'l2 mac stop {iface}'."
+            f"{limit}. Stop it with 'lan mac stop {iface}'."
         )
 
     def stop(self, interface: str) -> str:

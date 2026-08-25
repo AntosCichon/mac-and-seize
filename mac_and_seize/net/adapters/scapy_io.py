@@ -18,6 +18,7 @@ from scapy.all import (
     IP,
     TCP,
     UDP,
+    AsyncSniffer,
     Ether,
     conf,
     get_if_list,
@@ -364,6 +365,34 @@ def send_l2(frame, iface_name: str, *, count: int = 1) -> None:
     output is suppressed so nothing lands on the interactive prompt.
     """
     _sendp(frame, iface=iface_name, count=count, verbose=False)
+
+
+def dispatch_sniffer(
+    iface_name: str,
+    handler,
+    *,
+    bpf_filter: str | None = None,
+):
+    """Build (but don't start) a background sniffer that *dispatches* frames.
+
+    Unlike :func:`sniff` and the store-backed
+    :class:`~mac_and_seize.net.session.PacketSession`, nothing is accumulated:
+    each frame is handed to ``handler`` as it arrives and then dropped
+    (``store=False``). That suits a protocol conversation - where a frame is
+    only interesting for as long as it takes to answer it, and holding every
+    frame of a long-running exchange would just grow without bound.
+
+    ``handler`` runs on the sniffer's own thread, so it must be quick and must
+    never write to stdout/stderr (see modules/README.md §9). The caller owns the
+    lifecycle: ``.start()`` it, and ``.stop()`` it when done.
+
+    Frames the host itself sends are seen here too - the capture path has no
+    notion of "outgoing" - so a handler that also *transmits* has to recognise
+    and skip its own traffic or it will answer itself.
+    """
+    return AsyncSniffer(
+        iface=iface_name, filter=bpf_filter, prn=handler, store=False
+    )
 
 
 def sniff(

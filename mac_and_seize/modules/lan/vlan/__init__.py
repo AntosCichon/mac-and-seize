@@ -1,6 +1,6 @@
 """VLAN automations (not implemented yet).
 
-Skeleton area of the :mod:`mac_and_seize.modules.l2` module. It contributes no
+Skeleton area of the :mod:`mac_and_seize.modules.lan` module. It contributes no
 commands yet - only a staged group description that activates once actions are
 added here. To implement it, mirror the ``mac`` area: add ``service.py`` /
 ``actions.py`` and return the actions from :func:`build_actions` (and populate
@@ -12,9 +12,9 @@ from __future__ import annotations
 #: Service key -> zero-arg factory. None yet.
 SERVICES: dict = {}
 
-#: Staged label; the ``l2 vlan`` group appears once this area has commands.
+#: Staged label; the ``lan vlan`` group appears once this area has commands.
 GROUP_DESCRIPTIONS = {
-    "l2.vlan": "VLAN automations (not implemented yet)",
+    "lan.vlan": "VLAN automations (not implemented yet)",
 }
 
 
