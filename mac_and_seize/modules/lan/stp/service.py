@@ -239,6 +239,11 @@ class _StpJob:
     thread: threading.Thread | None = None
     task: object | None = None
     sent: int = 0
+    #: When ``lan stp spoof --relay <egress>`` is used, the relay handle for
+    #: the straddle-bridge flow the RelayService set up for this job.
+    #: Torn down in :meth:`_finalize` alongside the poison thread.
+    relay_handle: object | None = None
+
     @property
     def key(self) -> str:
         return self.iface
@@ -353,7 +358,11 @@ class StpService:
         }
 
     def spoof(
-        self, context: "AppContext", interface: str,
+        self,
+        context: "AppContext",
+        interface: str,
+        *,
+        relay_egress: str | None = None,
     ) -> str:
         """Start a background STP root-bridge spoof on ``interface``.
 
@@ -362,24 +371,68 @@ class StpService:
         non-zero configured priority will re-elect around us within a few
         hello intervals. Returns immediately; the prompt stays usable. Stop
         every running STP job with ``lan stp stop``.
+
+        When ``relay_egress`` is given, a straddle relay is started that
+        bridges frames verbatim between ``interface`` and ``relay_egress``
+        - the traffic pattern the spoofed root sees on the wire once the
+        segment recomputes. The relay is a Python bridge and is not suitable
+        for high-throughput segments; for physically in-line taps use a
+        kernel bridge outside this tool.
         """
         iface = _validate_iface(interface)
         src_mac = _read_iface_mac(iface)
-        return self._start(
-            context,
-            _StpJob(
-                iface=iface,
-                kind="spoof",
-                src_mac=src_mac,
-                started_at=time.monotonic(),
-            ),
-            summary=(
-                f"STP root-bridge spoof started on {iface} as {src_mac} at "
-                f"priority {_SPOOF_PRIORITY} (sending a configuration BPDU "
-                f"every {_HELLO_S:g}s). Stop every running STP job with "
-                "'lan stp stop'."
-            ),
+        if relay_egress is not None:
+            egress = _validate_iface(relay_egress)
+            if egress == iface:
+                raise ValueError(
+                    "--relay must name a *different* interface from the one "
+                    "the spoof runs on (straddle needs two NICs)."
+                )
+        else:
+            egress = None
+        job = _StpJob(
+            iface=iface,
+            kind="spoof",
+            src_mac=src_mac,
+            started_at=time.monotonic(),
         )
+        # Start the relay *before* the spoof so a failed relay setup doesn't
+        # leave a running poison job behind. Handled all-or-nothing.
+        if egress is not None:
+            try:
+                job.relay_handle = context.service("relay").begin_straddle(
+                    context, iface_a=iface, iface_b=egress,
+                )
+            except KeyError as exc:
+                raise ModuleError(
+                    "The 'relay' module is not loaded; cannot start "
+                    "--relay for lan stp spoof."
+                ) from exc
+        try:
+            summary = self._start(
+                context,
+                job,
+                summary=(
+                    f"STP root-bridge spoof started on {iface} as {src_mac} at "
+                    f"priority {_SPOOF_PRIORITY} (sending a configuration BPDU "
+                    f"every {_HELLO_S:g}s)."
+                    + (
+                        f" Straddle relay bridging {iface} <-> {egress} is "
+                        "running alongside (Python bridge - low throughput)."
+                        if egress is not None
+                        else ""
+                    )
+                    + " Stop every running STP job with 'lan stp stop'."
+                ),
+            )
+        except Exception:
+            if job.relay_handle is not None:
+                try:
+                    context.service("relay").end(job.relay_handle)
+                except Exception:  # noqa: BLE001
+                    self._log.debug("Relay rollback failed", exc_info=True)
+            raise
+        return summary
 
     def dos(
         self,
@@ -568,6 +621,19 @@ class StpService:
         context = self._context
         if job.task is not None and context is not None:
             context.tasks.finish(job.task)
+
+        # Tear down the coupled relay handle (see spoof(...)) alongside the
+        # poison thread; the relay outlives no useful state once the job
+        # stops re-electing us as root. Idempotent: RelayService.end() drops
+        # unknown handles silently.
+        if job.relay_handle is not None and context is not None:
+            try:
+                context.service("relay").end(job.relay_handle)
+            except Exception:  # noqa: BLE001 - teardown must not raise at the prompt
+                self._log.debug(
+                    "STP: relay teardown failed", exc_info=True,
+                )
+            job.relay_handle = None
 
         # A user-driven stop (stop_event set by stop_all()) is reported by
         # that command; stay quiet to avoid a duplicate line. A job that

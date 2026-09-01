@@ -36,6 +36,7 @@ def _spoof(context: "AppContext", values: dict) -> str:
         values["mac"],
         values["method"],
         target=values.get("target"),
+        relay=bool(values.get("relay")),
     )
 
 
@@ -52,11 +53,11 @@ def build_actions() -> list[Action]:
             "<mac>, so target hosts update their ARP caches and redirect "
             "traffic for <ip> to the given MAC (requires root). Frames leave "
             "<interface>, and <method> picks the delivery style: 'reply' "
-            "sends one forged ARP reply per target - unicast to the target's "
+            "sends one forged ARP reply per target - unicast to the target "
             "MAC when known (e.g. from 'discovered'), else broadcast - which "
             "is what a victim expects to see after sending an ARP request; "
             "'gratuitous' sends one L2-broadcast frame per target subnet with "
-            "'pdst' set to that subnet's directed broadcast, so a single "
+            "'pdst' set to that subnet directed broadcast, so a single "
             "frame announces the binding to every host on the segment (fewer "
             "packets, whole-segment reach). Either way --target chooses whom "
             "to poison and accepts a single IP, a CIDR (192.168.1.0/24), a "
@@ -67,8 +68,22 @@ def build_actions() -> list[Action]:
             "background and the prompt stays usable; stop every running "
             "spoof with 'lan arp stop'. Use the top-level 'tasks' command to "
             "see what is running. Several spoofs can run at once as long as "
-            "they claim different (interface, ip) pairs. For authorized "
-            "security testing only.",
+            "they claim different (interface, ip) pairs.\n\n"
+            "--relay additionally starts an L2 MiTM relay via the shared "
+            "relay module: frames arriving at <mac> from any poisoned target "
+            "get their dst-MAC rewritten to the real MAC of <ip> (learned "
+            "up-front from discovery or an ARP probe) and are reinjected on "
+            "<interface>, so the legitimate host of <ip> actually receives them. "
+            "This is a Python bridge (throughput ceiling in the low tens of "
+            "kpps) and only covers one direction - to relay the reverse "
+            "direction too, start a second 'lan arp spoof' with the roles "
+            "swapped and --relay set. The relay is torn down alongside the "
+            "spoof and touches only a dedicated nftables INPUT-drop table "
+            "(mas_relay) that stops the kernel from double-processing what "
+            "the relay is handling. Pre-flight check: --relay requires <mac> "
+            "to be the own MAC of <interface> (otherwise poisoned traffic goes to "
+            "some other host and the relay would never see a frame). "
+            "For authorized security testing only.",
             _spoof,
             [
                 Param("interface", "Interface to send frames from (e.g. eth0)"),
@@ -85,12 +100,21 @@ def build_actions() -> list[Action]:
                     "(a.b.c.10-20), or 'discovered'",
                     required=False,
                 ),
+                Param(
+                    "relay",
+                    "Start an L2 MiTM relay alongside (Python bridge)",
+                    bool,
+                    required=False,
+                    default=False,
+                    is_flag=True,
+                ),
             ],
             [
                 "lan arp spoof eth0 192.168.1.1 aa:bb:cc:dd:ee:ff reply --target 192.168.1.100",
                 "lan arp spoof eth0 192.168.1.1 aa:bb:cc:dd:ee:ff reply --target 192.168.1.10-20",
                 "lan arp spoof eth0 192.168.1.1 aa:bb:cc:dd:ee:ff gratuitous --target 192.168.1.0/24",
                 "lan arp spoof eth0 192.168.1.1 aa:bb:cc:dd:ee:ff gratuitous --target discovered",
+                "lan arp spoof eth0 192.168.1.1 aa:bb:cc:dd:ee:ff reply --target 192.168.1.100 --relay",
             ],
             requires_root=True,
         ),

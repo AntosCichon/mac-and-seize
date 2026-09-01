@@ -109,20 +109,20 @@ def build_actions() -> list[Action]:
             "NIC is on, or the keyword 'discovered' to re-probe every host found "
             "so far (a quick liveness recheck). For a CIDR the network and "
             "broadcast addresses are skipped. ARP is not routed, so only hosts on "
-            "the local link are found. Each host's 'state' column reflects the "
+            "the local link are found. The 'state' column of each host reflects the "
             "most recent scan - up (replied), down (in range but silent), or N/A "
-            "(outside this scan's range) - and a host first seen by the latest "
+            "(outside the range of this scan) - and a host first seen by the latest "
             "scan is marked with a '*' before its address. The prompt stays usable "
             "while it runs and a line announces completion regardless of your "
             "current context; results appear in 'discovery list' and 'discovery "
             "inspect'. Cancelling is instant ('discovery cancel'). The sweep "
-            "mirrors nmap's -PR host discovery (requires root).",
+            "mirrors the -PR host discovery of nmap (requires root).",
             _scan,
             [
                 Param(
                     "target",
                     "Scan target: IP, CIDR, last-octet range, hostname, a local "
-                    "interface name (scans that NIC's subnet), or 'discovered'",
+                    "interface name (scans the subnet of that NIC), or 'discovered'",
                 ),
                 Param(
                     "timeout",
@@ -144,9 +144,9 @@ def build_actions() -> list[Action]:
             "discovery.tcp",
             "TCP SYN port scan",
             "Start a background TCP SYN scan (half-open - the handshake is never "
-            "completed, mirroring nmap's -sS) for open ports on a target: a single "
+            "completed, mirroring the -sS mode of nmap) for open ports on a target: a single "
             "IP, CIDR, last-octet range, hostname, a local interface name (scans "
-            "that NIC's subnet), or the keyword 'discovered' to scan every host "
+            "the subnet of that NIC), or the keyword 'discovered' to scan every host "
             "found so far. Unlike an ARP host sweep this is routed, so it reaches "
             "hosts beyond the local link. --port takes a single port, a list "
             "(22,80,443), or a range (default 1-1000). Open ports are attached to "
@@ -188,7 +188,7 @@ def build_actions() -> list[Action]:
             "forms as 'discovery tcp', including 'discovered'). A closed UDP port "
             "answers with an ICMP port-unreachable; an open one usually stays "
             "silent, so a port that never replies is recorded as 'open|filtered' "
-            "(open or firewalled - can't tell apart; shown with a trailing '?' in "
+            "(open or firewalled - cannot tell apart; shown with a trailing '?' in "
             "the ports column). --port takes a single port, a list, or a range "
             "(default 1-1000). Note UDP scanning is slow and less certain than "
             "TCP: the kernel rate-limits ICMP errors, so scanning many ports "
@@ -282,7 +282,7 @@ def build_actions() -> list[Action]:
             "Cancel running scan(s)",
             "Cancel whichever discovery scans are running - a host scan, a port "
             "scan, or both (they run independently). This is instant: a new scan "
-            "can start immediately, and each cancelled scan's probe finishes on "
+            "can start immediately, and the probe of each cancelled scan finishes on "
             "its own in the background with its results discarded (requires root).",
             _cancel,
             examples=["discovery cancel"],

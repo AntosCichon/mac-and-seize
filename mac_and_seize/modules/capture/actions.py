@@ -42,7 +42,10 @@ def _service(context: "AppContext") -> "CaptureService":
 
 def _start(context: "AppContext", values: dict) -> str:
     return _service(context).start(
-        context, time=values.get("time"), count=values.get("count")
+        context,
+        time=values.get("time"),
+        count=values.get("count"),
+        relay=bool(values.get("relay")),
     )
 
 
@@ -104,19 +107,49 @@ def build_actions() -> list[Action]:
         Action(
             "capture.start",
             "Start capture",
-            "Start capturing packets in the background using the current filter "
-            "set. The prompt stays usable while it runs; stop it with "
-            "'capture stop' (requires root).",
+            "Start capturing packets in the background. The prompt stays "
+            "usable while it runs; stop it with 'capture stop' (requires "
+            "root).\n\n"
+            "Default mode (no --relay): open an AsyncSniffer on the "
+            "interfaces the current filter set allows and store every frame "
+            "that survives the include/exclude filters. This is the whole-"
+            "segment view - you see everything on the wire, then keep or "
+            "drop it via 'capture filter add ...'. --time / --count bound "
+            "the run.\n\n"
+            "--relay mode: open NO sniffer. Instead, subscribe to the "
+            "shared relay module fan-out and store ONLY frames that are "
+            "being relayed by an active 'lan arp/dhcp/stp ... --relay' (or "
+            "'... --nat-relay') job. This is the clean MiTM view: the "
+            "packet store contains exactly what the relay is passing "
+            "through, nothing else on the interface. The current filter "
+            "set is ignored in this mode (the own BPFs of the relay already "
+            "select traffic) and --time / --count are not supported (the "
+            "relay decides when frames arrive; use 'capture stop' to end "
+            "the attach). Errors cleanly if no relay flows are running. "
+            "Use --relay when you want a MiTM-only capture; use the "
+            "default mode plus include filters when you want the wider "
+            "segment view.\n\n"
+            "The two modes are mutually exclusive - only one capture runs "
+            "at a time.",
             _start,
             [
                 Param("time", "Stop after N seconds (whole capture)", int,
                       required=False),
                 Param("count", "Stop after N packets", int, required=False),
+                Param(
+                    "relay",
+                    "Capture only frames relayed by the relay module",
+                    bool,
+                    required=False,
+                    default=False,
+                    is_flag=True,
+                ),
             ],
             [
                 "capture start",
                 "capture start --time 30",
                 "capture start --count 100 --time 60",
+                "capture start --relay",
             ],
             requires_root=True,
         ),
@@ -132,7 +165,7 @@ def build_actions() -> list[Action]:
         Action(
             "capture.export",
             "Export packets",
-            "Export the session's captured packets to a file. Only the 'pcap' "
+            "Export the captured packets in the session to a file. Only the 'pcap' "
             "format is currently supported. Relative paths are written under the "
             "'exports/' directory; pass an absolute path to write elsewhere.",
             _export,
@@ -166,8 +199,8 @@ def build_actions() -> list[Action]:
             "Add filter(s)",
             "Add capture filters. Structure: 'add <include|exclude> <fields>'. "
             "Each field value (comma lists / numeric ranges for port) becomes a "
-            "separate filter entry with its own id. Include filters are OR'd; an "
-            "exclude match always drops the packet.",
+            "separate filter entry with its own id. Include filters are combined "
+            "with OR; an exclude match always drops the packet.",
             _filter_add,
             [
                 Param("action", "include (capture matches) or exclude (drop matches)"),

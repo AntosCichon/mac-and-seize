@@ -170,7 +170,7 @@ def _ip_actions() -> list[Action]:
         actions.append(Action(
             f"interface.{fam}.set",
             f"Set IPv{version} address",
-            f"Replace the interface's IPv{version} address(es) with a single "
+            f"Replace the IPv{version} address(es) of the interface with a single "
             "address (requires root). Flushing the old address drops the routes "
             "that depended on it (the default gateway, static routes); they are "
             "restored automatically unless --no-preserve is given.",

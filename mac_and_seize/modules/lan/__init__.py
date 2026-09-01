@@ -3,12 +3,22 @@
 Auto-discovered via :func:`register`. Unlike a flat feature module, ``lan`` is an
 umbrella over several LAN areas, each in its own sub-package: ``mac`` (CAM/
 MAC-table saturation - the ``flood`` / ``stop`` commands), ``arp`` (ARP cache
-poisoning - the ``spoof`` / ``stop`` commands), ``stp`` (spanning-tree
-reconnaissance and BPDU injection - ``learn`` / ``spoof`` / ``dos`` / ``stop``)
-plus ``dhcp`` and ``vlan`` skeletons that will grow their own commands later.
-``register()`` aggregates each area's services, actions and group descriptions
-into one :class:`~mac_and_seize.core.plugins.ModuleSpec`, so implementing an
-area later is just filling in its sub-package - it is already listed here.
+poisoning - the ``spoof`` / ``stop`` commands, plus ``--relay`` on ``spoof`` for
+an on-segment L2 MiTM), ``stp`` (spanning-tree reconnaissance and BPDU
+injection - ``learn`` / ``spoof`` / ``dos`` / ``stop``, plus ``--relay
+<egress-iface>`` on ``spoof`` for a two-NIC straddle bridge), ``dhcp`` (pool
+starvation and rogue server - ``find`` / ``starve`` / ``server``, plus
+mutually-exclusive ``--relay`` / ``--nat-relay`` on ``server start`` for
+one-way scapy vs. two-way kernel-NAT MiTM), and a ``vlan`` skeleton to be
+filled in later. ``register()`` aggregates each area's services, actions and
+group descriptions into one :class:`~mac_and_seize.core.plugins.ModuleSpec`, so
+implementing an area later is just filling in its sub-package - it is already
+listed here.
+
+The ``--relay`` / ``--nat-relay`` extensions delegate to the shared
+:mod:`~mac_and_seize.modules.relay` module through
+``context.service("relay")``; see ``modules/README.md`` §8 for the coupling
+pattern and the plan at ``.cursor/plans/`` for the full design.
 
 Sub-packages are *internal*: module discovery only scans the direct children of
 ``mac_and_seize.modules`` (see :mod:`mac_and_seize.core.plugins`), so ``lan.mac``

@@ -306,7 +306,7 @@ def build_wireless_actions() -> list[Action]:
         Action(
             "wireless.capture.export",
             "Export 802.11 frames",
-            "Export the wireless session's frames to a pcap file (openable in "
+            "Export the frames of the wireless session to a pcap file (openable in "
             "Wireshark). Relative paths are written under 'exports/'.",
             _export,
             [
@@ -332,8 +332,9 @@ def build_wireless_actions() -> list[Action]:
             "Add 802.11 filter(s)",
             "Add wireless capture filters. Structure: 'add <include|exclude> "
             "<fields>'. Each field value (comma list) becomes a separate filter "
-            "with its own id. Include filters are OR'd; an exclude match always "
-            "drops the frame. Fields: bssid, ssid, type (mgmt/ctrl/data), subtype "
+            "with its own id. Include filters are combined with OR; an exclude "
+            "match always drops the frame. Fields: bssid, ssid, type "
+            "(mgmt/ctrl/data), subtype "
             "(beacon/probe-req/probe-resp/auth/deauth/rts/cts/qos-data/...).",
             _filter_add,
             [
@@ -380,9 +381,9 @@ def build_wireless_actions() -> list[Action]:
             "spam several at once - and each can be stopped independently with "
             "'wireless beacon stop <name>'. By default each job beacons from a "
             "single bogus (random, locally-administered) BSSID, steadily like a "
-            "real AP, so the network shows up as a stable entry in a device's Wi-Fi "
-            "list; --randomize instead sends a fresh bogus address on every frame "
-            "(a phantom-AP flood - louder, but a phone's network list hides an SSID "
+            "real AP, so the network shows up as a stable entry in the Wi-Fi list "
+            "of a device; --randomize instead sends a fresh bogus address on every frame "
+            "(a phantom-AP flood - louder, but the network list of a phone hides an SSID "
             "whose BSSID never settles, so that mode is for a Wi-Fi analyzer, not "
             "for making one network appear). The radio is put into monitor mode "
             "automatically on the first job and restored when the last one stops; "
@@ -391,7 +392,7 @@ def build_wireless_actions() -> list[Action]:
             "often NO-IR, where an injected beacon never actually transmits); "
             "--channel overrides that with a number, list (1,6,11) or range (1-11) - "
             "a single channel is fixed, several are hopped, and each beacon is built "
-            "for its channel's band. The channel plan is shared by all jobs (one "
+            "for the band of its channel. The channel plan is shared by all jobs (one "
             "radio) and set by the first. --duration stops each job automatically "
             "after N seconds (reported when it elapses). The prompt stays usable "
             "while it runs. For authorized wireless security testing only.",

@@ -10,8 +10,8 @@ mac_and_seize/
   __main__.py            entry point for `python -m mac_and_seize`
   cli/                    Typer app and interactive shell (front-end)
   core/                   framework-agnostic primitives: actions, context, presenter, plugin discovery
-  modules/                feature modules (interface, capture, ...)
-  net/                    shared network domain: model (entities/value objects) + adapters (ip/scapy/ioctl)
+  modules/                feature modules (interface, capture, relay, ...)
+  net/                    shared network domain: model (entities/value objects) + adapters (ip/scapy/ioctl) + session/relay bases
   config/                 configuration models and loader
   observability/          logging setup
   server/                 stub for the planned web interface
@@ -88,6 +88,19 @@ stub for now).
 | `host.py` | `Host` record; hosts are found by the ARP sweep (inspired by nmap's `-PR`) or imported from a pcap, tracked in `Host.method` (`arp`/`pcap`). |
 | `actions.py` | The `discovery` command group: `host` (scan/cancel/import/list/clear/summary) and a `service` stub. |
 
+**`relay/`** — centralized traffic-relay/forwarding service. Turns the tool's
+redirection primitives (`lan.arp`, `lan.dhcp server`, `lan.stp spoof`) into
+real MiTMs. Flows are started implicitly by passing `--relay` (or `--nat-relay`
+on `lan dhcp server`) to a redirection command; the module's own command surface
+is view/stop only. See [`net/relay.py`](net/relay.py) and
+[`net/adapters/forwarding.py`](net/adapters/forwarding.py) for the shared
+plumbing this module orchestrates.
+
+| File | Purpose |
+| --- | --- |
+| `service.py` | `RelayService` — session-scoped registry of running relay handles; owns `begin_l2_onseg` (ARP MiTM), `begin_l3_gateway_scapy` (rogue-DHCP one-way scapy bridge), `begin_l3_gateway_kernel` (rogue-DHCP two-way kernel NAT), `begin_straddle` (STP two-NIC bridge), plus `end`/`end_all`, NAT-set update hooks and a `subscribe_all` fan-out that `capture start --relay` attaches to. |
+| `actions.py` | The `relay` command group: `list` (view running flows), `stop` (tear all down + restore any global state). |
+
 ### `net/`
 
 Shared network domain layer (see [`net/README.md`](net/README.md) for the
@@ -100,11 +113,13 @@ model/adapters split and dependency rule).
 | `model/interface.py` | `Interface` — the pure interface entity (data + `to_dict`, no I/O). |
 | `model/packet.py` | `Packet` — the scapy packet wrapper (factories, layer access, summaries). |
 | `session.py` | `PacketSession` — shared background packet-capture session base (packet store + `AsyncSniffer` lifecycle, pcap export/import), reused by the `capture` and `wireless` modules. |
+| `relay.py` | `RelayFlow` + `RelaySession` — paired receive-and-reinject lifecycle used by the `relay` module: one or more `AsyncSniffer`s, per-flow `rewrite_fn` (dst-MAC only), self-echo suppression, subscriber fan-out for `capture start --relay`, and a monitor thread that fires an `on_death` callback on sniffer death / send-failure streak. Peer of `session.py`. |
 | `adapters/ip.py` | Link/address/route operations via `ip`, plus sysfs `read_state`/`is_up`. |
 | `adapters/ethtool.py` | `get_permanent_mac()` via a raw `SIOCETHTOOL` ioctl. |
 | `adapters/netifaces_io.py` | Interface enumeration and address records via `netifaces`. |
 | `adapters/scapy_io.py` | `send()`, `sniff()`, `write_pcap()`, `read_pcap()`, `available_interfaces()`, `refresh_interfaces()`, and host discovery (`expand_hosts()`, `arp_probe()`, `mac_vendor()`). |
 | `adapters/wireless.py` | 802.11 control via nl80211/PyRIC: monitor mode, verified channel set, PHY topology (`list_phys`/`phy_of`/`interfaces_on_phy`), monitor-VIF create/teardown (`add_monitor`/`del_interface`), and `interfering_daemons()`. |
+| `adapters/forwarding.py` | sysctl snapshot/restore (`SysctlSnapshot`, `snapshot_and_set`, `restore_sysctls`) and dedicated nftables tables (`mas_relay` INPUT-drop, `mas_relay_nat` MASQUERADE) used by the `relay` module; `purge_stale_tables()` self-heals across crashes. |
 | `adapters/privileged.py` | `run()` (privileged-subprocess helper), `PrivilegedCommandError`, `family_flag()`. |
 
 ### `config/`

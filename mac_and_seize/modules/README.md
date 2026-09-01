@@ -287,6 +287,25 @@ one feature needs belongs in `net/`, not in a peer module. If you find yourself
 wanting to import from another module, that code should move down into `net/`
 (model if it's a pure type, adapters if it touches the OS/scapy).
 
+**One deliberate exception at runtime**: some cross-module *behavior* is best
+expressed by fetching another module's service through the shared service
+registry rather than by moving code down into `net/`. Two precedents:
+
+- `lan.arp` reads hosts from `discovery` via
+  `context.service("discovery").list_rows()` when the user passes
+  `--target discovered` (see
+  [`lan/arp/service.py`](lan/arp/service.py):`_resolve_targets`).
+- `lan.arp`, `lan.dhcp`, `lan.stp`, and `capture` all reach the shared
+  traffic-relay service via `context.service("relay")` when their
+  `--relay` / `--nat-relay` flag is set (see the `relay` module and the
+  matching plumbing in [`net/relay.py`](../net/relay.py) /
+  [`net/adapters/forwarding.py`](../net/adapters/forwarding.py)).
+
+Use this pattern when the coupling is *dynamic* (the caller decides at run
+time whether to consult the peer service) and one-way (no cyclic imports).
+Keep the shared *primitives* — types, adapters, session bases — in `net/`
+regardless.
+
 ---
 
 ## 9. Stateful services & background tasks

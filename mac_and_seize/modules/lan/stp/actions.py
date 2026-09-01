@@ -42,7 +42,11 @@ def _learn(context: "AppContext", values: dict) -> dict:
 
 
 def _spoof(context: "AppContext", values: dict) -> str:
-    return _service(context).spoof(context, values["interface"])
+    return _service(context).spoof(
+        context,
+        values["interface"],
+        relay_egress=values.get("relay"),
+    )
 
 
 def _dos(context: "AppContext", values: dict) -> str:
@@ -61,7 +65,7 @@ def build_actions() -> list[Action]:
             "lan.stp.learn",
             "Learn the STP topology on a port",
             "Listen for BPDUs on <interface> and, once the window closes, "
-            "report the segment's current root bridge (priority and MAC), "
+            "report the current root bridge on the segment (priority and MAC), "
             "the upstream switch this port is attached to (its bridge "
             "priority and MAC, plus the port ID it is using), and the "
             "advertised timers (hello time, max age, forward delay). Also "
@@ -91,7 +95,7 @@ def build_actions() -> list[Action]:
             "Start a background job that periodically sends a configuration "
             "BPDU on <interface> claiming to be the root bridge at priority "
             "0 (the lowest, i.e. best, 802.1D priority). Frames use the "
-            "interface's own MAC as the bridge ID, so a peer already at "
+            "own MAC of the interface as the bridge ID, so a peer already at "
             "priority 0 with a lower MAC still keeps the root - that is the "
             "802.1D tie-break and this command does not cheat it. Against "
             "any segment where every bridge is at default priority (32768) "
@@ -100,10 +104,30 @@ def build_actions() -> list[Action]:
             "goes through us. The prompt stays usable; use the top-level "
             "'tasks' command to see what is running. Only one STP job runs "
             "per interface; stop every running job with 'lan stp stop'. "
+            "--relay <egress-iface> additionally starts a straddle relay "
+            "that bridges frames verbatim between <interface> and the given "
+            "egress NIC, matching the picture the spoofed root would see if "
+            "physically inserted between two segments. The relay is a "
+            "Python bridge and forwards at low tens of kpps at best; do "
+            "not use it on a segment with real broadcast/multicast volume "
+            "- for physically in-line taps use a kernel bridge outside "
+            "this tool. The relay is torn down alongside the spoof (either "
+            "explicitly via 'lan stp stop' or when this job self-terminates). "
             "For authorized security testing only.",
             _spoof,
-            [Param("interface", "Interface to send BPDUs from (e.g. eth0)")],
-            ["lan stp spoof eth0"],
+            [
+                Param("interface", "Interface to send BPDUs from (e.g. eth0)"),
+                Param(
+                    "relay",
+                    "Straddle-bridge egress iface (Python bridge)",
+                    str,
+                    required=False,
+                ),
+            ],
+            [
+                "lan stp spoof eth0",
+                "lan stp spoof eth0 --relay eth1",
+            ],
             requires_root=True,
         ),
         Action(

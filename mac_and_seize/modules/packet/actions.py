@@ -103,8 +103,8 @@ def build_actions() -> list[Action]:
         Action(
             "packet.edit",
             "Edit a packet",
-            "Re-open the interactive builder pre-filled with a saved packet's "
-            "layers and values. Saving replaces the packet in place; cancelling "
+            "Re-open the interactive builder pre-filled with the layers and "
+            "values of a saved packet. Saving replaces the packet in place; cancelling "
             "leaves it unchanged.",
             _edit,
             [Param("name", "Name of the saved packet to edit")],

