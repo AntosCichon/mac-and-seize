@@ -34,8 +34,8 @@ def _list(context: "AppContext", values: dict):
     rows = _service(context).list_rows()
     if not rows:
         return (
-            "No relay flows are running. Start one by passing '--relay' (or "
-            "'--nat-relay' on 'lan dhcp server') to a redirection command."
+            "No relay flows are running. Start one by passing '--relay' to "
+            "any command that supports MITM functionalities"
         )
     return rows
 

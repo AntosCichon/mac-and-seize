@@ -9,8 +9,10 @@ injection - ``learn`` / ``spoof`` / ``dos`` / ``stop``, plus ``--relay
 <egress-iface>`` on ``spoof`` for a two-NIC straddle bridge), ``dhcp`` (pool
 starvation and rogue server - ``find`` / ``starve`` / ``server``, plus
 mutually-exclusive ``--relay`` / ``--nat-relay`` on ``server start`` for
-one-way scapy vs. two-way kernel-NAT MiTM), and a ``vlan`` skeleton to be
-filled in later. ``register()`` aggregates each area's services, actions and
+one-way scapy vs. two-way kernel-NAT MiTM), and ``vlan`` (DTP spoofing and
+802.1Q double-tag hopping - ``learn`` / ``dtp-spoof`` / ``hop`` / ``stop``,
+with ``--mode {desirable,trunk}`` on ``dtp-spoof`` picking which DTP status
+the hellos advertise). ``register()`` aggregates each area's services, actions and
 group descriptions into one :class:`~mac_and_seize.core.plugins.ModuleSpec`, so
 implementing an area later is just filling in its sub-package - it is already
 listed here.

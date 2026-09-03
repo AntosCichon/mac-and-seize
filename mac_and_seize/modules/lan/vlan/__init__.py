@@ -1,23 +1,28 @@
-"""VLAN automations (not implemented yet).
+"""VLAN automations: DTP spoofing and 802.1Q double-tag hopping.
 
-Skeleton area of the :mod:`mac_and_seize.modules.lan` module. It contributes no
-commands yet - only a staged group description that activates once actions are
-added here. To implement it, mirror the ``mac`` area: add ``service.py`` /
-``actions.py`` and return the actions from :func:`build_actions` (and populate
-``SERVICES`` if the area needs a session-scoped service).
+Exposes the ``lan vlan`` command surface (``learn`` / ``dtp-spoof`` / ``hop`` /
+``stop``) and the session-scoped
+:class:`~mac_and_seize.modules.lan.vlan.service.VlanService`. The parent
+:mod:`mac_and_seize.modules.lan` package aggregates the names below into the
+module's :class:`~mac_and_seize.core.plugins.ModuleSpec`.
 """
 
 from __future__ import annotations
 
-#: Service key -> zero-arg factory. None yet.
-SERVICES: dict = {}
+from mac_and_seize.modules.lan.vlan.actions import (
+    GROUP_DESCRIPTIONS,
+    SERVICE,
+    build_actions,
+)
+from mac_and_seize.modules.lan.vlan.service import VlanService
 
-#: Staged label; the ``lan vlan`` group appears once this area has commands.
-GROUP_DESCRIPTIONS = {
-    "lan.vlan": "VLAN automations (not implemented yet)",
-}
+#: Service key -> factory, merged into the module's services by ``lan.register()``.
+SERVICES = {SERVICE: VlanService}
 
-
-def build_actions() -> list:
-    """No commands yet; see the module docstring to implement this area."""
-    return []
+__all__ = [
+    "GROUP_DESCRIPTIONS",
+    "SERVICE",
+    "SERVICES",
+    "VlanService",
+    "build_actions",
+]

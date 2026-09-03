@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import re
 import shlex
+import signal
 import sys
 from dataclasses import dataclass, field
 from itertools import product
@@ -56,14 +57,61 @@ from mac_and_seize.util.system import is_root, relaunch_as_root
 console = Console()
 logger = get_logger("mac_and_seize.cli.interactive")
 
-_HELP_WORDS = {"help", "h", "?"}
-_QUIT_WORDS = {"quit", "exit", "q"}
-_BACK_WORDS = {"back", ".."}
+# Alias tuples for the six built-in verbs. Kept as *tuples* (not sets) so their
+# order is stable: the canonical name is first, followed by its aliases. Every
+# code path that uses these does an ``in`` check, which works identically on a
+# tuple, and :func:`_root_help` re-uses the order below to render the aliases
+# on the left of the Built-in section (comma separated). Adding a new alias in
+# one place therefore also updates the help screen - one source of truth.
+_HELP_WORDS = ("help", "h", "?")
+_QUIT_WORDS = ("quit", "exit", "q")
+_BACK_WORDS = ("back", "..")
 # ``home`` jumps straight to the root context; ``/`` mirrors the ``/``-separated
 # path shown in the prompt (mac-and-seize/interface -> root).
-_HOME_WORDS = {"home", "/"}
+_HOME_WORDS = ("home", "/")
 # Built-ins offered as first-word completions (canonical spellings only).
 _BUILTIN_WORDS = ["help", "back", "home", "sudo", "tasks", "quit"]
+
+# The Built-in section of the root help screen. Each entry is
+# ``(display_aliases, help_text)``: the left column shows every alias for the
+# verb (canonical first, joined with ``", "``), the right column describes
+# it. Aliases are derived from the ``*_WORDS`` tuples above so a new alias in
+# one place is picked up here too; ``Ctrl-D`` on the ``quit`` row is a
+# display-only alias (it's a keyboard shortcut, not a typable word - it stays
+# out of ``_QUIT_WORDS`` because :func:`_dispatch` never sees the string).
+# The ``help`` row's description mentions both ``help <command>`` and
+# ``<command> ?`` because :func:`_dispatch` accepts both forms (see the
+# ``if token.lower() in _HELP_WORDS`` branches).
+_BUILTIN_HELP: list[tuple[str, str]] = [
+    (", ".join(_HELP_WORDS),
+     "Show help; 'help <command>' or '<command> ?' for details"),
+    (", ".join(_BACK_WORDS),
+     "Leave the current group (one level up)"),
+    (", ".join(_HOME_WORDS),
+     "Jump back to the top level from anywhere"),
+    ("sudo",
+     "Relaunch the app with root privileges"),
+    ("tasks",
+     "List running background tasks"),
+    (", ".join((*_QUIT_WORDS, "Ctrl-D")),
+     "Leave the session"),
+]
+
+# Printed when the user hits Ctrl-C at the (responsive) prompt instead of
+# typing a quit word. Rationale: Ctrl-C during a blocking foreground command
+# (a scan, a ``learn`` sleep, an ``srp`` timeout) *does* cancel that command -
+# see the ``KeyboardInterrupt`` catch around ``_dispatch`` in
+# :func:`run_interactive` - but Ctrl-C at an empty prompt used to quit the
+# whole session, which is hostile: it drops running background jobs (their
+# threads are daemon so they die with the process) and burns whatever session
+# state the user built up. Print the real exit commands and the split between
+# foreground Ctrl-C and background ``tasks``-managed jobs instead, so a stray
+# Ctrl-C is a teachable moment rather than a footgun.
+_QUIT_HINT = (
+    "To quit the session, type '[cyan]quit[/]', '[cyan]exit[/]', '[cyan]q[/]' "
+    "or press [cyan]Ctrl+D[/]. Use [cyan]Ctrl+C[/] to cancel any running "
+    "command (not background tasks, see module '[cyan]tasks[/]')"
+)
 
 
 def _location(context_path: list[str]) -> str:
@@ -267,6 +315,17 @@ def run_interactive(context: AppContext) -> None:
     # stdout/stderr from a worker thread. Each is lifted above the prompt instead
     # of corrupting the line; everything is restored on exit.
     _restore_output_guards = _install_prompt_output_guards(context)
+    # Defensive: some libraries (scapy's sniff/sr paths, curses, older
+    # third-party helpers) install their own SIGINT handler and forget to
+    # restore Python's default. That would either swallow Ctrl-C silently or
+    # deliver it to some other handler than the main-thread ``KeyboardInterrupt``
+    # this REPL relies on. Reinstate the default handler once at session start
+    # so both branches below (Ctrl-C at the prompt, Ctrl-C during a blocking
+    # foreground command) get a predictable ``KeyboardInterrupt`` on the main
+    # thread. Worker threads receive no signal - background jobs (dtp-spoof,
+    # arp spoof, ...) keep running, which is what a user pressing Ctrl-C to
+    # cancel a *foreground* command expects.
+    _restore_sigint = _install_sigint_handler()
     console.print(
         "\n[bold]Interactive session.[/] "
         "Type '[cyan]help[/]' to get started, '[cyan]quit[/]' to exit.\n"
@@ -277,9 +336,22 @@ def run_interactive(context: AppContext) -> None:
         while True:
             try:
                 line = input(_prompt(context_path)).strip()
-            except (EOFError, KeyboardInterrupt):
+            except EOFError:
+                # Ctrl-D at the prompt: end of input, honor it as a quit
+                # (long-standing Unix convention; also listed in _QUIT_HINT).
                 console.print()
                 break
+            except KeyboardInterrupt:
+                # Ctrl-C at a *responsive* prompt: don't quit. Quitting here
+                # is hostile - it kills running background jobs (their daemon
+                # threads die with the process) and burns session state, and
+                # a stray Ctrl-C is easy to hit. Guide the user to the real
+                # exit commands instead. readline has already discarded the
+                # partially-typed line; the newline separates ^C from the
+                # message readline is about to redraw the prompt below.
+                console.print()
+                console.print(_QUIT_HINT)
+                continue
 
             if not line:
                 continue
@@ -310,14 +382,82 @@ def run_interactive(context: AppContext) -> None:
                 context_path = _dispatch(context, tree, context_path, tokens)
             except UsageError as exc:
                 console.print(f"[red]{exc}[/]")
+            except KeyboardInterrupt:
+                # Ctrl-C while a foreground command was running. Python
+                # delivered SIGINT to the main thread and raised
+                # ``KeyboardInterrupt`` wherever the handler was blocking
+                # (``time.sleep`` in a ``learn`` window, an ``srp`` timeout,
+                # a ``sniff`` join). The handler's own ``try/finally`` has
+                # already run its cleanup by the time we get here (see e.g.
+                # ``VlanService.learn`` stopping its sniffers, ``DhcpService.
+                # find`` closing its offer sniffer); this catch just keeps
+                # the REPL alive instead of letting ``KeyboardInterrupt``
+                # blow through the outer ``except Exception`` (it doesn't
+                # catch ``BaseException``) and take the process with it.
+                # Background jobs are untouched - the top-level ``tasks``
+                # command still lists them.
+                #
+                # Report ``context.current_command`` rather than ``tokens[0]``
+                # so the message stays *the same* whether the user ran
+                # ``lan vlan learn eth0`` from the root prompt or ``learn
+                # eth0`` from inside the ``lan vlan`` group: ``_execute``
+                # sets ``current_command`` to the canonical full path
+                # (``action.command_path`` + args) before invoking the
+                # handler. Fall back to the literal tokens if we somehow
+                # got interrupted before ``_execute`` set it (parse-time
+                # errors, unknown command) - the user's typed line is
+                # still the most informative thing in that edge case.
+                cancelled = context.current_command or " ".join(tokens)
+                console.print()
+                console.print(
+                    f"[yellow]^C - '{cancelled}' interrupted.[/] "
+                    "Background tasks (if any) are still running; see "
+                    "'[cyan]tasks[/]'."
+                )
+                logger.info("User interrupted: %s", cancelled)
             except Exception as exc:  # noqa: BLE001 - keep the session alive
                 console.print(f"[red]Unexpected error:[/] {exc}")
                 logger.exception("Unexpected error handling: %s", " ".join(tokens))
     finally:
+        _restore_sigint()
         _restore_output_guards()
 
     console.print("Goodbye.")
     logger.info("Interactive session ended")
+
+
+def _install_sigint_handler() -> Callable[[], None]:
+    """Force Python's default SIGINT handler for the session; return the undo.
+
+    Python's default (``signal.default_int_handler``) is what raises
+    ``KeyboardInterrupt`` on the main thread when SIGINT arrives - the
+    guarantee the REPL's two Ctrl-C branches depend on. Something (scapy's
+    receive loops, curses, a third-party helper) may have replaced it before
+    we ran; put it back for the duration of the session and restore whatever
+    was there on exit so we don't disturb a wider embedding.
+
+    Only meaningful on the main thread - ``signal.signal`` raises
+    ``ValueError`` from a worker thread, which happens if this function is
+    ever called from a subagent that spawned the REPL. In that case we log
+    at debug and become a no-op; the embedding is responsible for its own
+    SIGINT policy.
+    """
+    try:
+        previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    except (ValueError, OSError):  # not on the main thread, or unsupported OS
+        logger.debug(
+            "SIGINT handler not installed (not on main thread or unsupported)",
+            exc_info=True,
+        )
+        return lambda: None
+
+    def restore() -> None:
+        try:
+            signal.signal(signal.SIGINT, previous)
+        except (ValueError, OSError):
+            logger.debug("SIGINT handler restore failed", exc_info=True)
+
+    return restore
 
 
 def _install_prompt_output_guards(context: AppContext) -> Callable[[], None]:
@@ -826,12 +966,13 @@ def _root_help(descriptions: dict[str, str], root: Node) -> None:
             console.print(f"  [{_color(child.action)}]{name:<12}[/] {child.action.title}")
 
     console.print("\n[bold]Built-in[/]")
-    console.print(f"  [cyan]{'help, ?':<10}[/] Show help; 'help <command>' for details")
-    console.print(f"  [cyan]{'back':<10}[/] Leave the current group (one level up)")
-    console.print(f"  [cyan]{'home':<10}[/] Jump back to the top level from anywhere")
-    console.print(f"  [cyan]{'sudo':<10}[/] Relaunch the app with root privileges")
-    console.print(f"  [cyan]{'tasks':<10}[/] List running background tasks")
-    console.print(f"  [cyan]{'quit':<10}[/] Leave the session (also: exit, Ctrl-D)")
+    # Column width is the widest alias set (currently the quit row at
+    # ``quit, exit, q, Ctrl-D``, 22 chars), plus a two-space gutter. Derived
+    # here rather than hard-coded so adding an alias to the ``*_WORDS`` tuples
+    # keeps the layout tidy on its own.
+    width = max(len(label) for label, _ in _BUILTIN_HELP) + 2
+    for aliases, help_text in _BUILTIN_HELP:
+        console.print(f"  [cyan]{aliases:<{width}}[/] {help_text}")
 
 
 def _group_help(descriptions: dict[str, str], node: Node, path: list[str]) -> None:
